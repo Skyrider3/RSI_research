@@ -128,3 +128,16 @@ def test_namespaces_do_not_collide():
 def test_sha256_json_canonical():
     assert sha256_json({"a": 1, "b": [1, 2]}) == sha256_json({"b": [1, 2], "a": 1})
     assert sha256_json({"a": 1}) != sha256_json({"a": 2})
+
+
+def test_golden_values_are_stable():
+    """Pin the key/seed derivation: any change silently invalidates every stored run (its cells would no
+    longer match their re-planned requests), so it must be a deliberate, versioned change."""
+    assert _key() == "6cf0226228b96ca1095df8368bffd739281d7ed7c2ba467d58be8fb107f54dce"
+    assert _key(decoding=T02, seed=7, nonce="rerun:3") == (
+        "ed42c73213db604945ff2ea5a3867f0beeab3fca9a3a6937b5e13ddd9c73753c"
+    )
+    assert sample_seed(0, "eval", "t02", 3, "round", 5, "test", 17) == 85220003
+    assert proposer_seed(1, 2, 0) == 898977416
+    assert rng_seed(0, "errors", 1) == 629778058
+    assert engine_fingerprint({"kind": "vllm", "version": "0.6.3", "gpu": "T4"}) == "391e61d03372dca0"

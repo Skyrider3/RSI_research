@@ -73,13 +73,18 @@ def to_fraction(s: str) -> Fraction | None:
         return None
 
 
+def _digits(n: int) -> str:
+    """Decimal digits of a non-negative int; via Decimal, so exempt from the int->str digit limit."""
+    return str(Decimal(n))
+
+
 def canonical(value: Fraction | int) -> str:
     """Canonical string: "18", "-3", "0.5", "1234.5" for terminating decimals, "p/q" otherwise."""
     v = Fraction(value)
     sign = "-" if v < 0 else ""
     num, den = abs(v.numerator), v.denominator
     if den == 1:
-        return f"{sign}{num}"
+        return f"{sign}{_digits(num)}"
     twos = fives = 0
     d = den
     while d % 2 == 0:
@@ -89,9 +94,9 @@ def canonical(value: Fraction | int) -> str:
         d //= 5
         fives += 1
     if d != 1:
-        return f"{sign}{num}/{den}"
+        return f"{sign}{_digits(num)}/{_digits(den)}"
     k = max(twos, fives)  # minimal k with value * 10**k integral -> no trailing zeros
-    digits = str(num * 10**k // den).rjust(k + 1, "0")
+    digits = _digits(num * 10**k // den).rjust(k + 1, "0")
     return f"{sign}{digits[:-k]}.{digits[-k:]}"
 
 

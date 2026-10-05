@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from driftlab.backends.base import Backend, GenRequest, GenResult
 from driftlab.engine import (
@@ -23,7 +26,7 @@ from driftlab.engine import (
 from driftlab.environments import Decoding
 from driftlab.keys import engine_fingerprint, proposer_seed, sample_seed, sha256_text
 from driftlab.prompting import PROPOSER_SYSTEM
-from driftlab.store import ShardWriter, Store, replay_shards
+from driftlab.store import CellConflict, EngineMismatch, ShardWriter, Store, list_shards, replay_shards
 
 RUN = "run_eng"
 GREEDY = Decoding(id="greedy", temperature=0.0)
@@ -308,7 +311,9 @@ def test_error_results_are_not_cached(store: Store):
     with pytest.raises(GenerationError):
         eng.run([task(i) for i in range(3)], stage="s", purpose="p")
     assert store.count_rows("generations") == 2 and store.count_rows("cells") == 2
-    assert ledger_sums(store) == (2, 2, 0)
+    ok, err = store.ledger_rows(RUN)  # the failed (paid-for) call is logged separately, never cached
+    assert (ok["stage"], ok["n_requested"], ok["n_executed"], ok["n_cache_hits"]) == ("s", 2, 2, 0)
+    assert (err["stage"], err["n_requested"], err["n_executed"], err["n_cache_hits"]) == ("s:error", 1, 1, 0)
     fixed = GenerationEngine(FakeBackend(), store, RUN, chunk_size=10)
     recs = fixed.run([task(i) for i in range(3)], stage="s", purpose="p")
     assert [r.cached for r in recs] == [True, False, True]
@@ -456,3 +461,205 @@ def test_fail_after_zero_chunks_generates_nothing(store: Store):
     with pytest.raises(InjectedFailure):
         eng.run([task(0)], stage="s", purpose="p")
     assert store.count_rows("generations") == 0 and store.count_rows("ledger") == 0
+
+
+# ---------------------------------------------------------------- review regressions: integrity guards
+def test_replanned_cell_raises_before_any_model_call(store: Store):
+    # e.g. physical_greedy_reruns switched from 'none' to 'all' under allow_config_change: the cell already
+    # points at the cached creation generation; the nonce'd rerun used to be paid for while the stored
+    # cell silently kept the by-construction generation (physical=0)
+    be = FakeBackend()
+    eng = GenerationEngine(be, store, RUN)
+    (cached,) = eng.run([task(0, draw=2)], stage="s", purpose="p")
+    with pytest.raises(CellConflict):
+        eng.run([task(0, draw=2, nonce="rerun:2", physical=True), task(1)], stage="s", purpose="p")
+    assert be.n_generated == 1 and store.count_rows("generations") == 1
+    assert store.get_cells(RUN)[0]["gen_key"] == cached.gen_key
+    # re-submitting the identical plan (resume) is fine
+    assert eng.run([task(0, draw=2)], stage="s", purpose="p")[0].cached
+
+
+def test_same_cell_twice_with_different_requests_is_rejected(store: Store):
+    be = FakeBackend()
+    eng = GenerationEngine(be, store, RUN)
+    with pytest.raises(ValueError, match="twice"):
+        eng.run([task(1, dec=T02, req_seed=1), task(1, dec=T02, req_seed=2)], stage="s", purpose="p")
+    assert be.n_generated == 0
+    recs = eng.run([task(1), task(1)], stage="s", purpose="p")  # same request twice: fine
+    assert recs[1].cached and store.count_rows("cells") == 1
+
+
+def test_unseeded_sampling_is_rejected(store: Store):
+    # an unseeded t02 request would be cached and re-served to every "independent" draw of the cell
+    be = FakeBackend()
+    eng = GenerationEngine(be, store, RUN)
+    with pytest.raises(ValueError, match="seed"):
+        eng.run([task(0, dec=T02, req_seed=None)], stage="s", purpose="p")
+    with pytest.raises(ValueError, match="seed"):
+        eng.run([CellTask(None, GenRequest("sys", "user", PROPOSER))], stage="s", purpose="proposer")
+    assert be.n_generated == 0
+    eng.run([task(0, req_seed=None)], stage="s", purpose="p")  # greedy needs no seed
+
+
+def test_cell_decoding_must_match_request(store: Store):
+    eng = GenerationEngine(FakeBackend(), store, RUN)
+    bad = CellTask(CellKey(RUN, 0, "test", "greedy", 0, "round", 0, 0), task(0, dec=T02, req_seed=5).request)
+    with pytest.raises(ValueError, match="decoding"):
+        eng.run([bad], stage="s", purpose="p")
+    assert store.count_rows("generations") == 0
+
+
+def test_engine_refuses_a_run_recorded_with_another_engine(store: Store):
+    be = FakeBackend()
+    store.ensure_run(RUN, config_json="{}", config_hash="c", engine_fp="someone-elses-gpu", synthetic=True)
+    eng = GenerationEngine(be, store, RUN)
+    with pytest.raises(EngineMismatch):
+        eng.run([task(0)], stage="s", purpose="p")
+    assert be.n_generated == 0
+    store.ensure_run(RUN, config_json="{}", config_hash="c", engine_fp=eng.engine_fp, synthetic=True,
+                     allow_engine_change=True)  # fmt: skip
+    eng.run([task(0)], stage="s", purpose="p")
+    assert be.n_generated == 1
+
+
+# ---------------------------------------------------------------- review regressions: Colab crash + restore
+def test_hard_kill_then_restore_from_old_snapshot_plus_shards_matches_uninterrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """VM dies after a shard was published but before its COMMIT; the local DB is lost. Restore = an older
+    Drive snapshot + every shard (incl. the orphan) -> resume -> identical store. The same orphan on a
+    surviving local DB is quarantined instead."""
+    ref = Store(tmp_path / "ref.sqlite")
+    _run_workload(GenerationEngine(FakeBackend(), ref, RUN, chunk_size=4))
+    want = ref.content_digest(RUN)
+
+    live = Store(tmp_path / "vm" / "db.sqlite")
+    drive = tmp_path / "drive"
+    w = ShardWriter.for_store(live, drive / "shards")
+    with pytest.raises(InjectedFailure):
+        _run_workload(
+            GenerationEngine(FakeBackend(), live, RUN, chunk_size=4, fail_after_chunks=2, shard_writer=w)
+        )
+    snapshot = live.backup_to(drive / "snapshot.sqlite")
+    with pytest.raises(InjectedFailure):
+        _run_workload(
+            GenerationEngine(FakeBackend(), live, RUN, chunk_size=4, fail_after_chunks=2, shard_writer=w)
+        )
+
+    def killed(*a: object, **k: object) -> None:
+        raise KeyboardInterrupt("VM preempted")
+
+    monkeypatch.setattr(live, "_record_shard", killed)  # dies after the shard is published, before COMMIT
+    monkeypatch.setattr(w, "discard", lambda *a, **k: None)  # a hard kill runs no cleanup
+    with pytest.raises(KeyboardInterrupt):
+        _run_workload(GenerationEngine(FakeBackend(), live, RUN, chunk_size=4, shard_writer=w))
+    monkeypatch.undo()
+    last = int(live.get_meta("last_shard_seq"))
+    assert [s for s, _ in list_shards(drive / "shards")][-1] == last + 1  # the orphan
+    shutil.copytree(drive, tmp_path / "drive_copy")
+
+    # (a) new VM: old snapshot + all shards
+    (tmp_path / "vm2").mkdir()
+    restored = Store(shutil.copy(snapshot, tmp_path / "vm2" / "db.sqlite"))
+    assert int(restored.get_meta("last_shard_seq")) < last
+    replay_shards(restored, drive / "shards")
+    be = FakeBackend()
+    _run_workload(
+        GenerationEngine(
+            be, restored, RUN, chunk_size=4, shard_writer=ShardWriter.for_store(restored, drive / "shards")
+        )
+    )
+    assert restored.content_digest(RUN) == want
+    assert be.n_generated < ref.count_rows("generations")  # restored work is not regenerated
+
+    # (b) same VM, local DB survived: the orphan is quarantined and its chunk regenerated
+    with pytest.warns(UserWarning, match="quarantined"):
+        w2 = ShardWriter.for_store(live, tmp_path / "drive_copy" / "shards")
+    assert len(w2.orphans) == 1
+    _run_workload(GenerationEngine(FakeBackend(), live, RUN, chunk_size=4, shard_writer=w2))
+    assert live.content_digest(RUN) == want
+    for s in (ref, live, restored):
+        s.close()
+
+
+# ---------------------------------------------------------------- review regressions: accounting property
+_POOL = [task(i, slot=s, draw=d) for i in range(4) for s in range(2) for d in range(2)] + [
+    task(i, dec=T02, req_seed=sd, slot=sd - 10, draw=d) for i in range(3) for sd in (11, 12) for d in range(2)
+]  # same request at two draws of a cell column (lean-style cache hits); distinct cells throughout
+
+
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    pre=st.lists(st.integers(0, len(_POOL) - 1), max_size=6),
+    picks=st.lists(st.integers(0, len(_POOL) - 1), min_size=1, max_size=24),
+    proposers=st.integers(0, 2),
+    chunk=st.integers(1, 5),
+)
+def test_ledger_and_records_invariants(pre: list[int], picks: list[int], proposers: int, chunk: int):
+    """For any mix of cache hits, in-call duplicates, proposer calls and chunk sizes: records align with
+    tasks, sum(n_requested) == len(tasks), sum(n_executed) == backend generations, cells are complete."""
+    store = Store(":memory:")
+    be = FakeBackend()
+    eng = GenerationEngine(be, store, RUN, chunk_size=chunk)
+    # warm the cache through other cells with the same requests (generations exist, cells do not)
+    warm = [CellTask(None, _POOL[i].request) for i in dict.fromkeys(pre)]
+    if warm:
+        eng.run(warm, stage="warm", purpose="p")
+    store.conn.execute("DELETE FROM ledger")
+    before = be.n_generated
+    tasks = [_POOL[i] for i in picks] + [proposer_task(1, a) for a in range(proposers)]
+    recs = eng.run(tasks, stage="s", purpose="p")
+    executed = be.n_generated - before
+    rows = store.ledger_rows(RUN)
+    assert sum(r["n_requested"] for r in rows) == len(tasks)
+    assert sum(r["n_executed"] for r in rows) == executed
+    assert all(r["n_cache_hits"] == r["n_requested"] - r["n_executed"] for r in rows)
+    assert executed == len({eng.key_for(t.request) for t in tasks} - {eng.key_for(t.request) for t in warm})
+    gens = store.lookup_generations([r.gen_key for r in recs])
+    for t, r in zip(tasks, recs, strict=True):
+        assert r.gen_key == eng.key_for(t.request) and r.text == gens[r.gen_key]["response"]
+    assert sum(not r.cached for r in recs) == executed  # exactly one fresh record per generated key
+    cells = {
+        (c["slot"], c["decoding_id"], c["draw"], c["item_idx"]): c["gen_key"] for c in store.get_cells(RUN)
+    }
+    want = {(t.cell.slot, t.cell.decoding_id, t.cell.draw, t.cell.item_idx): eng.key_for(t.request)
+            for t in tasks if t.cell is not None}  # fmt: skip
+    assert cells == want
+    store.close()
+
+
+def test_failed_calls_are_accounted_for_in_the_ledger(store: Store):
+    # error results used to vanish from the ledger although the model call was paid for
+    be = FakeBackend(fail_users={task(1).request.user})
+    eng = GenerationEngine(be, store, RUN, chunk_size=10)
+    tasks = [task(0), task(1), task(1, draw=1), task(2)]
+    with pytest.raises(GenerationError):
+        eng.run(tasks, stage="s", purpose="eval_matrix", seed=0, round_=1)
+    rows = store.ledger_rows(RUN)
+    assert sum(r["n_requested"] for r in rows) == len(tasks)  # every task of the chunk is accounted for
+    assert sum(r["n_executed"] for r in rows) == be.n_generated == 3
+    (err,) = [r for r in rows if r["stage"] == "s:error"]
+    assert (err["purpose"], err["round"], err["n_requested"], err["n_executed"], err["n_cache_hits"]) == (
+        "eval_matrix",
+        1,
+        2,
+        1,
+        1,
+    )
+    stored = sum(r["n_executed"] for r in rows if not r["stage"].endswith(":error"))
+    assert stored == store.count_rows("generations")
+    assert err["wall_s"] == 0.0  # wall time is not double counted
+
+
+def test_synthetic_backend_always_marks_the_run_synthetic(store: Store):
+    store.ensure_run(RUN, config_json="{}", config_hash="c", synthetic=False)  # caller forgot the flag
+    eng = GenerationEngine(FakeBackend(), store, RUN)  # FakeBackend.synthetic = True
+    eng.run([task(0)], stage="s", purpose="p")
+    assert store.get_run(RUN)["synthetic"] == 1
+
+    class Real(FakeBackend):
+        synthetic = False
+
+    store.ensure_run("real", config_json="{}", config_hash="c", synthetic=False)
+    GenerationEngine(Real(), store, "real").run([task(0, run_id="real")], stage="s", purpose="p")
+    assert store.get_run("real")["synthetic"] == 0

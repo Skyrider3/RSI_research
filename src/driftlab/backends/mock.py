@@ -293,10 +293,27 @@ def _parse_number(s: object) -> Fraction | None:
         return None
 
 
+def _decimal_places(v: Fraction) -> int | None:
+    """Digits after the point of ``v``'s exact decimal expansion; ``None`` if it does not terminate."""
+    d, places = v.denominator, 0
+    for p in (2, 5):
+        k = 0
+        while d % p == 0:
+            d, k = d // p, k + 1
+        places = max(places, k)
+    return places if d == 1 else None
+
+
 def _fmt(v: Fraction, commas: bool = False) -> str:
-    """Display a value: integers exactly, other values with at most 2 decimals."""
+    """Display a value: integers and terminating decimals exactly (so a solved answer always equals the
+    gold), other values rounded to at most 2 decimals."""
     if v.denominator == 1:
         return f"{v.numerator:,}" if commas else str(v.numerator)
+    places = _decimal_places(v)
+    if places is not None:  # exact: Decimal from a string is never rounded by the context
+        return format(
+            Decimal(f"{v.numerator * 10**places // v.denominator}E-{places}"), ",f" if commas else "f"
+        )
     s = f"{float(v):,.2f}" if commas else f"{float(v):.2f}"
     return s.rstrip("0").rstrip(".")
 
@@ -612,10 +629,16 @@ class MockBackend(Backend):
         answer_key: Mapping[str, str] | None = None,
     ) -> None:
         """``answer_key`` maps the exact user message (the question) to its gold answer (numeric string;
-        ``Fraction``/int values are accepted too). Questions outside it get a hashed pseudo-gold."""
+        ``Fraction``/int values are accepted too; a non-numeric value raises ``ValueError``). Questions
+        outside it get a hashed pseudo-gold."""
         super().__init__(model_id, model_revision)
-        self.cfg = cfg if cfg is not None else MockSection()
+        # Private copy: the engine fingerprints engine_info() once, so a later mutation of the caller's
+        # (shared, mutable) config section must not change outputs or half-invalidate the quality cache.
+        self.cfg = (cfg if cfg is not None else MockSection()).model_copy(deep=True)
         self._answer_key: dict[str, str] = {str(k): str(v) for k, v in (answer_key or {}).items()}
+        bad = [(k[:60], v) for k, v in self._answer_key.items() if _parse_number(v) is None]
+        if bad:  # would otherwise silently fall back to a pseudo-gold (that item can never be answered right)
+            raise ValueError(f"answer_key has {len(bad)} non-numeric gold value(s), e.g. {bad[:3]}")
         self._items: dict[str, _Item] = {}
         self._quality: dict[str, float] = {}
 

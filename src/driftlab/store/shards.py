@@ -7,8 +7,11 @@ written to ``*.tmp`` and published with ``os.replace``; ``sha8`` is the prefix o
 
 Restore procedure (Colab / Drive): copy the latest DB snapshot (``Store.backup_to``) -> open it ->
 :func:`replay_shards` (re-inserts every shard with ``seq > meta.last_shard_seq``) -> only then
-``ShardWriter.for_store(store, dir)`` to continue writing. A new writer quarantines files with
-``seq >= start_seq`` (renamed ``*.orphan``): they belong to transactions that never committed.
+``ShardWriter.for_store(store, dir)`` to continue writing. Shards are published before their transaction
+commits and a writer has at most one shard in flight, so after a hard kill at most ONE file
+(``seq == start_seq``) can be uncommitted: a new writer quarantines it (renamed ``*.orphan``). Files with
+``seq > start_seq`` mean the store is *behind* the log (a restore without replay); the writer refuses
+(:class:`ShardLogAhead`) instead of discarding committed work.
 """
 
 from __future__ import annotations
@@ -33,6 +36,16 @@ _STAGE_SAFE = re.compile(r"[^A-Za-z0-9.\-]+")
 
 class ShardCorrupt(ValueError):
     """A shard's content does not match the checksum in its file name, or cannot be parsed."""
+
+
+class ShardGap(ShardCorrupt):
+    """A shard sequence number is missing: replaying past it would leave cells pointing at generations
+    that were never restored (the planner would treat them as done)."""
+
+
+class ShardLogAhead(RuntimeError):
+    """The shard directory holds committed shards newer than the store: call :func:`replay_shards`
+    before creating a writer (a writer would otherwise quarantine committed work)."""
 
 
 def _safe_stage(stage: str) -> str:
@@ -87,17 +100,29 @@ class ShardWriter:
 
     @classmethod
     def for_store(cls, store: Store, dir: str | Path) -> ShardWriter:
-        """Writer continuing after the store's ``meta.last_shard_seq`` (replay newer shards first!)."""
+        """Writer continuing after the store's ``meta.last_shard_seq`` (replay newer shards first, or
+        :class:`ShardLogAhead` is raised)."""
         return cls(dir, int(store.get_meta("last_shard_seq") or 0) + 1)
 
     @property
     def next_seq(self) -> int:
         return self._next
 
+    def advance_to(self, next_seq: int) -> None:
+        """Never hand out a sequence number below ``next_seq`` (e.g. ``last_shard_seq + 1`` of the store)."""
+        self._next = max(self._next, int(next_seq))
+
     def _quarantine_orphans(self) -> list[Path]:
+        shards = list_shards(self.dir)
+        ahead = sorted({seq for seq, _ in shards if seq > self._next})
+        if ahead:
+            raise ShardLogAhead(
+                f"{self.dir} holds shard(s) {ahead[0]}..{ahead[-1]} beyond the store's next seq {self._next}: "
+                "the store is behind the shard log. Call replay_shards(store, dir) before creating the writer."
+            )
         moved = []
-        for seq, p in list_shards(self.dir):
-            if seq >= self._next:
+        for seq, p in shards:
+            if seq == self._next:  # published but never committed (hard kill between write and COMMIT)
                 dest = p.with_name(p.name + ".orphan")
                 os.replace(p, dest)
                 moved.append(dest)
@@ -105,7 +130,7 @@ class ShardWriter:
             p.unlink(missing_ok=True)
         if moved:
             warnings.warn(
-                f"quarantined {len(moved)} uncommitted shard(s) in {self.dir} (seq >= {self._next}); "
+                f"quarantined {len(moved)} uncommitted shard(s) in {self.dir} (seq {self._next}); "
                 "if you are restoring a snapshot, call replay_shards() before creating the writer",
                 stacklevel=3,
             )
@@ -145,11 +170,14 @@ class ShardWriter:
             self._next = int(seq)
 
 
-def replay_shards(store: Store, dir: str | Path) -> int:
+def replay_shards(store: Store, dir: str | Path, *, allow_gaps: bool = False) -> int:
     """Re-insert every shard with ``seq > meta.last_shard_seq`` (one transaction per shard, table
     policies of :class:`Store`), record it in ``shard_log`` and advance ``last_shard_seq``.
 
-    Returns the number of rows read from the replayed shards (rows already present are ignored).
+    A missing sequence number raises :class:`ShardGap` before anything past it is replayed (shards
+    before the gap stay applied), unless ``allow_gaps`` (then it only warns; cells may then reference
+    generations that are not in the store). Returns the number of rows read from the replayed shards
+    (rows already present are ignored).
     """
     last = int(store.get_meta("last_shard_seq") or 0)
     total = 0
@@ -160,7 +188,10 @@ def replay_shards(store: Store, dir: str | Path) -> int:
         if seq == prev:
             warnings.warn(f"duplicate shard sequence number {seq}: {path.name}", stacklevel=2)
         elif seq != prev + 1:
-            warnings.warn(f"gap in shard log before seq {seq} (last replayed {prev})", stacklevel=2)
+            msg = f"gap in shard log {dir}: seq {prev + 1}..{seq - 1} missing (last replayed {prev})"
+            if not allow_gaps:
+                raise ShardGap(msg)
+            warnings.warn(msg, stacklevel=2)
         payload, sha = _load_shard(path)
         n_rows = sum(len(rows) for rows in payload.values())
         store.apply_shard(seq, path.name, n_rows, sha, payload)

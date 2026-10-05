@@ -6,8 +6,12 @@ independently and must not be a dependency of these tests.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 from collections import Counter
 from fractions import Fraction
 from pathlib import Path
@@ -303,12 +307,28 @@ def test_greedy_rerun_flips_with_positive_rate(answer_key: dict[str, str], quest
         n += len(questions)
     assert 0.02 <= n_flip / n <= 0.09  # ~ greedy_flip_rate
     assert n_flip < n_diff <= 4 * n_flip  # some reruns change only the wording
-    # a flipped item really changes its outcome
-    for q in questions:
-        req = GenRequest(INITIAL, q, GREEDY, nonce="rerun:1")
-        info = b.explain(req)
+    # a flipped item really changes its *extracted* correctness; a wording-only divergence never changes the
+    # extracted answer; every other rerun is byte-identical to the creation generation
+    rerun = _run(b, INITIAL, questions, nonce="rerun:1")
+    seen: Counter[str] = Counter()
+    for q, x, y in zip(questions, base, rerun, strict=True):
+        info = b.explain(GenRequest(INITIAL, q, GREEDY, nonce="rerun:1"))
+        if not (info["flipped"] or info["diverged"]):
+            assert x == y
+            continue
+        assert x.text != y.text
+        if "length" in (x.finish_reason, y.finish_reason):
+            continue
+        before = same_number(lenient_value(x.text), answer_key[q])
+        after = same_number(lenient_value(y.text), answer_key[q])
         if info["flipped"]:
+            seen["flipped"] += 1
             assert info["solved"] != b.explain(GenRequest(INITIAL, q, GREEDY))["solved"]
+            assert before != after
+        else:
+            seen["diverged"] += 1
+            assert lenient_value(x.text) == lenient_value(y.text) and before == after
+    assert seen["flipped"] > 0 and seen["diverged"] > 0
 
 
 def test_flip_rate_does_not_touch_sampling_or_non_nonce(
@@ -399,6 +419,63 @@ def test_answer_key_accepts_numbers_and_fractions() -> None:
 def test_answer_key_from_jsonl(answer_key: dict[str, str]) -> None:
     assert answer_key_from_jsonl(DATA) == answer_key
     assert len(answer_key) == 200
+
+
+def test_answer_key_from_jsonl_falls_back_to_answer(tmp_path: Path) -> None:
+    rows = [
+        {"question": "Q1?", "answer": "3 + 4 = 7\n#### 7"},
+        {"question": "Q2?", "answer": "so 1,234 in total\n#### 1,234"},
+        {"question": "Q3?", "answer": "x\n#### 5", "gold": "5"},
+        {"question": "Q4?", "answer": "x\n#### 9", "gold": None},
+    ]
+    path = tmp_path / "split.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n\n", encoding="utf-8")
+    assert answer_key_from_jsonl(path) == {"Q1?": "7", "Q2?": "1234", "Q3?": "5", "Q4?": "9"}
+
+
+def test_non_numeric_answer_key_value_raises() -> None:
+    """Regression: a non-numeric gold silently became a pseudo-gold (the item could never be answered right)."""
+    for bad in ("N/A", "", "nan", None):
+        with pytest.raises(ValueError, match="non-numeric"):
+            MockBackend(MODEL, REV, answer_key={"How many apples?": bad})  # type: ignore[dict-item]
+
+
+def test_solved_answers_equal_decimal_golds() -> None:
+    """Regression: terminating decimal golds were printed rounded to 2 decimals (2.125 -> 2.12), so a solved
+    item was scored wrong by every extractor."""
+    golds = ("2.125", "-1.5", "0.0009765625", "12345.678")
+    key = {f"Item {i}: a shop sells {i} pens. How much is it?": golds[i % 4] for i in range(80)}
+    b = MockBackend(MODEL, REV, answer_key=key)
+    n_solved = 0
+    for q, g in key.items():
+        assert b.gold_for(q) == g
+        req = GenRequest(INITIAL, q, GREEDY)
+        info, text = b.explain(req), b.generate([req])[0].text
+        if info["solved"] and info["format"] != "truncated":
+            n_solved += 1
+            assert info["value"] == g and same_number(lenient_value(text), g)
+            if info["format"] == "box":
+                assert same_number(strict_value(text), g)
+    assert n_solved >= 20
+
+
+def test_config_is_copied(answer_key: dict[str, str], questions: list[str]) -> None:
+    """Regression: the backend aliased the caller's MockSection, so mutating it after the engine had
+    fingerprinted engine_info() changed outputs, and only for prompts not yet in the quality cache."""
+    cfg = MockSection(greedy_flip_rate=0.1)
+    b = MockBackend(MODEL, REV, cfg, answer_key)
+    info = b.engine_info()
+    reqs = [GenRequest(p, q, GREEDY, nonce="rerun:1") for p in (INITIAL, GOOD) for q in questions[:30]]
+    before = b.generate(reqs[:30])  # caches the quality of INITIAL only
+    cfg.base_quality, cfg.greedy_flip_rate, cfg.malformed_proposal_rate = -5.0, 0.0, 1.0
+    fresh = MockBackend(MODEL, REV, MockSection(greedy_flip_rate=0.1), answer_key)
+    assert b.engine_info() == info == fresh.engine_info()
+    assert b.generate(reqs) == fresh.generate(reqs) and before == fresh.generate(reqs[:30])
+    assert b.quality(GOOD) == fresh.quality(GOOD)
+
+
+def test_empty_batch() -> None:
+    assert MockBackend(MODEL, REV).generate([]) == []
 
 
 # --------------------------------------------------------------------------- answer formats
@@ -556,7 +633,7 @@ def test_proposer_determinism() -> None:
     assert s1 == MockBackend(MODEL, REV).generate([GenRequest(PROPOSER_SYSTEM, meta, PROPOSER, seed=11)])
 
 
-@pytest.mark.parametrize("rate", [0.0, 0.1, 0.3])
+@pytest.mark.parametrize("rate", [0.0, 0.1, 0.3, 1.0])
 def test_malformed_rate(rate: float) -> None:
     b = MockBackend(MODEL, REV, MockSection(malformed_proposal_rate=rate))
     meta = _meta_prompt()
@@ -564,7 +641,10 @@ def test_malformed_rate(rate: float) -> None:
     res = b.generate([GenRequest(PROPOSER_SYSTEM, meta, PROPOSER, seed=s) for s in range(n)])
     kinds = Counter(_classify_proposal(r.text) for r in res)
     bad = (n - kinds["ok"]) / n
-    assert abs(bad - rate) <= 0.05
+    if rate in (0.0, 1.0):
+        assert bad == rate  # the extremes are exact: never / always malformed
+    else:
+        assert abs(bad - rate) <= 0.05
     for s, r in enumerate(res):  # explain() reports exactly the malformation visible in the text
         info = b.explain(GenRequest(PROPOSER_SYSTEM, meta, PROPOSER, seed=s))
         assert info["mode"] == "proposer" and info["incumbent_found"] is True
@@ -585,6 +665,76 @@ def test_proposer_handles_missing_incumbent() -> None:
     b = MockBackend(MODEL, REV, MockSection(malformed_proposal_rate=0.0))
     r = b.generate([GenRequest(PROPOSER_SYSTEM, "Improve the prompt.", PROPOSER, seed=1)])[0]
     assert "\\boxed" in PROMPT_TAG_RE.findall(r.text)[-1]
+
+
+# --------------------------------------------------------------------------- frozen behaviour
+
+# Inline on purpose (not the packaged templates): the pin must move only when the mock itself changes.
+_PIN_PROMPTS = (
+    "You are a helpful assistant that solves grade-school math word problems. Solve the problem step by step, "
+    "and put your final answer within \\boxed{}.",
+    "Answer as briefly as possible. State units in the final answer. Put the answer in \\boxed{}.",
+    "You solve math word problems.",
+)
+_PIN_META = (
+    f"<current_prompt>\n{_PIN_PROMPTS[0]}\n</current_prompt>\n\n### Problem 1\nQ\n\n"
+    "### Correct final answer\n1250\n"
+)
+# MOCK_VERSION -> sha256 of _pinned_digest(). Add a new entry (never edit an old one) when the mock changes.
+PINNED_OUTPUT_DIGESTS = {"1": "36299004c086c52a7fbfd96150f91d70e5feac5b16003dde51bf008c71f804b9"}
+
+
+def _pinned_digest() -> str:
+    """sha256 of the mock's outputs on a fixed request set covering every answer-mode and proposer path."""
+    rows = [json.loads(line) for line in DATA.read_text(encoding="utf-8").splitlines()[:40]]
+    key = {r["question"]: r["gold"] for r in rows}
+    cfg = MockSection(base_quality=0.55, sample_sd=0.6, greedy_flip_rate=0.2, malformed_proposal_rate=0.3)
+    b = MockBackend(MODEL, REV, cfg, key)
+    reqs = [
+        req
+        for p in _PIN_PROMPTS
+        for n, q in enumerate(key)
+        for req in (
+            GenRequest(p, q, GREEDY),
+            GenRequest(p, q, T02, seed=n),
+            GenRequest(p, q, GREEDY, nonce="r:1"),
+        )
+    ]
+    reqs += [GenRequest(PROPOSER_SYSTEM, _PIN_META, PROPOSER, seed=s) for s in range(40)]
+    h = hashlib.sha256()
+    for r in b.generate(reqs):
+        h.update(
+            json.dumps(
+                [r.text, r.finish_reason, r.n_prompt_tokens, r.n_completion_tokens, r.latency_ms]
+            ).encode()
+        )
+    return h.hexdigest()
+
+
+def test_outputs_pinned_to_mock_version() -> None:
+    """Stored generations are found by gen_key, whose engine fingerprint covers engine_info() (and so
+    MOCK_VERSION) but not the mock's code: any change to generated outputs must bump MOCK_VERSION, otherwise
+    a resumed run silently mixes generations of two different synthetic models."""
+    assert _pinned_digest() == PINNED_OUTPUT_DIGESTS.get(MOCK_VERSION), (
+        "mock outputs changed: bump MOCK_VERSION and pin the new digest"
+    )
+
+
+def test_outputs_independent_of_hash_seed() -> None:
+    """Resume across processes: outputs must not depend on PYTHONHASHSEED (set/dict-order randomness)."""
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('tmb', {str(Path(__file__))!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['tmb'] = m; spec.loader.exec_module(m)\n"
+        "print(m._pinned_digest())\n"
+    )
+    want = _pinned_digest()
+    for hash_seed in ("0", "4242"):
+        env = {**os.environ, "PYTHONHASHSEED": hash_seed}
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+        )
+        assert out.stdout.strip() == want
 
 
 # --------------------------------------------------------------------------- property test

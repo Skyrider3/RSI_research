@@ -15,7 +15,10 @@ from driftlab.keys import sha256_text
 from driftlab.store import (
     ConfigMismatch,
     EngineMismatch,
+    ItemConflict,
     ShardCorrupt,
+    ShardGap,
+    ShardLogAhead,
     ShardWriter,
     SlotConflict,
     Store,
@@ -581,7 +584,7 @@ def test_shard_replay_restores_identical_store(store: Store, tmp_path: Path):
     assert ShardWriter.for_store(restored, shard_dir).next_seq == 8
     restored.close()
 
-    # (2) a fresh store from shards alone (items are not sharded here, so restore them first)
+    # (2) a fresh store from shards alone (items are not sharded here and not part of the digest)
     fresh = Store(tmp_path / "fresh.sqlite")
     replay_shards(fresh, shard_dir)
     assert fresh.content_digest(RUN) == want
@@ -655,3 +658,160 @@ def test_in_memory_store():
     s.put_items("test", _items(2))
     assert len(s.get_items("test")) == 2
     s.close()
+
+
+# ---------------------------------------------------------------- review regressions
+def test_replace_tables_keep_the_last_row_even_with_mixed_column_sets(store: Store):
+    # rows of one payload with different optional columns used to be batched by column set, which
+    # re-ordered them and broke "last row wins" for INSERT OR REPLACE tables
+    row = {"run_id": RUN, "seed": 0, "round": 1, "attempt": 0, "meta_prompt_hash": "m", "error_item_idxs": []}
+    store.write_tables(
+        {
+            "proposals": [
+                {**row, "valid": 0, "violations": ["first"]},
+                {**row, "valid": 1},  # no 'violations' column
+                {**row, "valid": 0, "violations": ["last"]},
+            ]
+        }
+    )
+    (p,) = store.get_proposals(RUN)
+    assert json.loads(p["violations"]) == ["last"] and p["valid"] == 0
+
+
+def test_numpy_arrays_are_stored_as_json_lists(store: Store):
+    row = {
+        "run_id": RUN,
+        "seed": 0,
+        "round": 1,
+        "attempt": 0,
+        "meta_prompt_hash": "m",
+        "error_item_idxs": np.array([4, 1, 7]),
+        "valid": np.bool_(False),
+    }
+    store.put_proposal(row)
+    assert json.loads(store.get_proposals(RUN)[0]["error_item_idxs"]) == [4, 1, 7]
+
+
+def test_put_items_refuses_wrong_split_and_changed_content(store: Store):
+    store.put_items("test", _items(3))
+    with pytest.raises(ValueError, match="split"):  # eval items passed off as dev items
+        store.put_items("train", [{**_items(1)[0], "split": "test"}])
+    assert store.get_items("train") == []
+    store.put_items("test", [{**_items(3)[1], "split": "test"}])  # same content: idempotent
+    with pytest.raises(ItemConflict):  # gold parser / snapshot changed under an existing run
+        store.put_items("test", [{**_items(3)[1], "gold": "11"}])
+    assert store.get_items("test")[1]["gold"] == "10"
+    store.put_items("test", [{"idx": 7, "question": "Q", "answer_text": "#### 5", "gold": 5}])
+    store.put_items(
+        "test", [{"idx": 7, "question": "Q", "answer_text": "#### 5", "gold": "5"}]
+    )  # int == text
+
+
+def test_prompts_can_be_sharded_and_enter_the_digest(store: Store, tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    w = ShardWriter.for_store(store, shard_dir)
+    h = store.put_prompt("meta prompt for round 1", shard_writer=w)
+    store.put_proposal(
+        {
+            "run_id": RUN,
+            "seed": 0,
+            "round": 1,
+            "attempt": 0,
+            "meta_prompt_hash": h,
+            "error_item_idxs": [1],
+            "valid": 1,
+        },
+        shard_writer=w,
+    )
+    store.put_items("test", _items(2), shard_writer=w)
+    fresh = Store(tmp_path / "fresh.sqlite")
+    replay_shards(fresh, shard_dir)
+    assert fresh.get_prompt(h) == "meta prompt for round 1"
+    assert fresh.content_digest(RUN) == store.content_digest(RUN)
+    assert len(fresh.get_items("test")) == 2
+    # an unsharded prompt write is visible in the digest (the restore would have lost its text)
+    store.put_prompt("unsharded")
+    assert fresh.content_digest(RUN) != store.content_digest(RUN)
+    fresh.close()
+
+
+def test_lookup_cells(store: Store):
+    gens, cells, ledger = _chunk("l", 3)
+    store.write_chunk(gens, cells, ledger)
+    got = store.lookup_cells(
+        RUN,
+        [
+            (0, "test", "greedy", 0, "round", 0, 1),
+            (0, "test", "greedy", 0, "round", 0, 9),
+            (1, "x", "g", 0, "round", 0, 0),
+        ],
+    )
+    assert got == {(0, "test", "greedy", 0, "round", 0, 1): {"gen_key": "l001", "physical": 1}}
+    assert store.lookup_cells("other", [(0, "test", "greedy", 0, "round", 0, 1)]) == {}
+
+
+def test_backup_refuses_to_overwrite_the_live_db(store: Store):
+    store.put_items("test", _items(2))
+    with pytest.raises(StoreError):
+        store.backup_to(store.path)
+    assert len(store.get_items("test")) == 2 and store.quick_check()
+
+
+def test_writer_refuses_store_behind_shard_log(store: Store, tmp_path: Path):
+    # creating a writer before replaying used to rename every newer (committed) shard to *.orphan
+    d = tmp_path / "s"
+    w = ShardWriter.for_store(store, d)
+    for i in range(3):
+        store.write_chunk(*_chunk(f"b{i}_", 2), shard_writer=w, stage="m")
+    want = store.content_digest(RUN)
+    fresh = Store(tmp_path / "fresh.sqlite")
+    with pytest.raises(ShardLogAhead):
+        ShardWriter.for_store(fresh, d)
+    assert [s for s, _ in list_shards(d)] == [1, 2, 3]  # nothing quarantined
+    assert replay_shards(fresh, d) == 3 * 5
+    assert fresh.content_digest(RUN) == want
+    assert ShardWriter.for_store(fresh, d).next_seq == 4
+    fresh.close()
+
+
+def test_replay_refuses_gaps(store: Store, tmp_path: Path):
+    d = tmp_path / "s"
+    w = ShardWriter.for_store(store, d)
+    store.write_chunk([_gen("g1")], [], None, shard_writer=w, stage="a")
+    store.write_chunk([_gen("g2")], [_cell("g1", 0, draw=1)], None, shard_writer=w, stage="b")  # refs shard 1
+    store.write_chunk([_gen("g3")], [], None, shard_writer=w, stage="c")
+    list_shards(d)[1][1].unlink()  # shard 2 lost (e.g. Drive sync failure)
+    fresh = Store(tmp_path / "fresh.sqlite")
+    with pytest.raises(ShardGap):
+        replay_shards(fresh, d)
+    assert fresh.get_meta("last_shard_seq") == "1"  # shards before the gap stay applied
+    assert fresh.count_rows("generations") == 1
+    with pytest.warns(UserWarning, match="gap"):
+        assert replay_shards(fresh, d, allow_gaps=True) == 1
+    assert fresh.get_meta("last_shard_seq") == "3"
+    fresh.close()
+
+
+def test_several_writer_instances_never_reuse_a_sequence_number(store: Store, tmp_path: Path):
+    d = tmp_path / "s"
+    a = ShardWriter.for_store(store, d)
+    b = ShardWriter.for_store(store, d)  # e.g. engine and trajectory each made their own writer
+    store.write_chunk(*_chunk("a", 1), shard_writer=a, stage="x")
+    store.put_slot(RUN, 0, 0, "p0", 0, None, "initial", shard_writer=b)
+    store.write_chunk(*_chunk("c", 1, draw=1), shard_writer=a, stage="x")
+    assert [s for s, _ in list_shards(d)] == [1, 2, 3]
+    assert [r["seq"] for r in store.shard_log()] == [1, 2, 3]
+    fresh = Store(tmp_path / "fresh.sqlite")
+    replay_shards(fresh, d)
+    assert fresh.content_digest(RUN) == store.content_digest(RUN)
+    fresh.close()
+
+
+def test_slot_guard_covers_lineage_not_just_text(store: Store):
+    store.put_slot(RUN, 0, 3, "Candidate three.", 3, 1, "proposer")
+    store.put_slot(RUN, 0, 3, "Candidate three.", 3, 1, "proposer")  # identical: idempotent
+    for args in ((3, 2, "proposer"), (4, 1, "proposer"), (3, 1, "fallback")):
+        with pytest.raises(SlotConflict):  # same text, different parent / round / origin
+            store.put_slot(RUN, 0, 3, "Candidate three.", *args)
+    (s,) = store.get_slots(RUN)
+    assert (s["created_round"], s["parent_slot"], s["origin"]) == (3, 1, "proposer")

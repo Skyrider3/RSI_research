@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-from driftlab.store.shards import ShardCorrupt, ShardWriter, list_shards, read_shard, replay_shards
+from driftlab.store.shards import (
+    ShardCorrupt,
+    ShardGap,
+    ShardLogAhead,
+    ShardWriter,
+    list_shards,
+    read_shard,
+    replay_shards,
+)
 from driftlab.store.store import (
+    CellConflict,
     ConfigMismatch,
     EngineMismatch,
+    ItemConflict,
     SlotConflict,
     Store,
     StoreError,
@@ -14,9 +24,13 @@ from driftlab.store.store import (
 )
 
 __all__ = [
+    "CellConflict",
     "ConfigMismatch",
     "EngineMismatch",
+    "ItemConflict",
     "ShardCorrupt",
+    "ShardGap",
+    "ShardLogAhead",
     "ShardWriter",
     "SlotConflict",
     "Store",

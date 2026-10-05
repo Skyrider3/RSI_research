@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import sys
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -167,6 +170,21 @@ GOLDEN: list[tuple[str, str | None, str | None, str, str]] = [
     ("\uff11\uff12 apples", None, "12", "none", "last_number"),
     ("x2 y3", None, None, "none", "none"),
     ("", None, None, "none", "none"),
+    # --- realistic Qwen-style endings -----------------------------------------------------
+    ("Therefore, the answer is \\(\\boxed{72}\\).", "72", "72", "boxed", "boxed"),
+    ("\\[\n\\boxed{72}\n\\]", "72", "72", "boxed", "boxed"),
+    ("### Final Answer\n\\boxed{72}", "72", "72", "boxed", "boxed"),
+    ("#### Final Answer\nThe total is \\(\\boxed{72}\\).", "72", "72", "boxed", "boxed"),
+    # --- documented spec-literal quirks (frozen; a fix needs a NEW version) ------------------
+    # A markdown "####" heading after the box is the selected marker (shared rule).
+    ("\\boxed{72}\n\n#### Verification\nWe check 72 / 2 = 36.", None, "72", "none", "boxed"),
+    ("\\boxed{72}\n\n#### Step 4: Verify\nWe check it.", None, "4", "none", "hash"),
+    ("#### Step 1: Cost\nIt is 5.\n#### Step 2: Multiply\n5 x 3 = 15 so", None, "2", "none", "hash"),
+    # The bold stage takes the first number of any bold span; NUM_RE has no lookahead.
+    ("**Step 3: Add the parts**\n5 + 13 = 18 and then we", None, "3", "none", "bold"),
+    ("We have 120,150,180 in total", None, "120150180", "none", "last_number"),
+    # The LAST box is selected even when it is empty.
+    ("\\boxed{18}\nThe final answer is \\boxed{}", None, "18", "none", "last_number"),
 ]
 
 
@@ -180,6 +198,12 @@ def _id(case: tuple) -> str:
 
 def test_golden_table_size() -> None:
     assert len(GOLDEN) >= 80
+
+
+def test_golden_table_covers_every_method() -> None:
+    """Every v2 stage (and both v1 outcomes per marker kind) is pinned by at least one golden case."""
+    assert {c[4] for c in GOLDEN} == set(METHODS)
+    assert {c[3] for c in GOLDEN} == {"boxed", "hash", "none"}
 
 
 @pytest.mark.parametrize(("text", "v1", "v2", "m1", "m2"), GOLDEN, ids=[_id(c) for c in GOLDEN])
@@ -237,6 +261,23 @@ def test_extracted_property_is_canonical() -> None:
     assert extract_v2(r"\boxed{\$1,234.50}").extracted == "1234.5"
     assert extract_v2(r"\boxed{\frac{1}{3}}").extracted == "1/3"
     assert extract_v1(r"\boxed{5.00}").extracted == "5"
+
+
+def test_huge_numbers_do_not_hit_the_int_str_limit() -> None:
+    """Regression: canonical() used str(int), which raises ValueError above 4300 digits (Python >= 3.10.7),
+    so ``Extraction.extracted`` (what scoring stores) crashed on a long digit run."""
+    big = "9" * 5000
+    for text in (f"\\boxed{{{big}}}", f"#### {big}", f"so {big}", f"\\boxed{{0.{big}}}"):
+        for fn in (extract_v1, extract_v2):
+            ex = fn(text)
+            if ex.value is not None:
+                assert gold_value(ex.extracted) == ex.value
+    assert extract_v1(f"\\boxed{{{big}}}").extracted == big
+    assert extract_v2(f"\\boxed{{-{big}.50}}").extracted == f"-{big}.5"
+    assert extract_v2(f"\\boxed{{\\frac{{1}}{{3{'0' * 5000}}}}}").extracted == f"1/3{'0' * 5000}"
+    assert canonical(Fraction(1, 2**5000)) == "0." + str(5**5000).rjust(5000, "0")  # 3495 digits
+    assert canonical(Fraction(-(10**6000) - 1, 3)) == "-1" + "0" * 5999 + "1/3"
+    assert gold_value(canonical(Fraction(7, 10**6000))) == Fraction(7, 10**6000)
 
 
 # --------------------------------------------------------------------------- shared helpers
@@ -415,6 +456,15 @@ def test_hash_and_tag_format() -> None:
     assert extractor_tags() == {n: extractor_tag(n) for n in REGISTRY}
 
 
+def test_hash_is_sha256_of_common_plus_version_module() -> None:
+    """Independent recomputation of the documented definition (not via the private helper)."""
+    src = REPO / "src" / "driftlab" / "extraction"
+    common = (src / "common.py").read_bytes().replace(b"\r\n", b"\n")
+    for name in REGISTRY:
+        module = (src / f"{name}.py").read_bytes().replace(b"\r\n", b"\n")
+        assert extractor_hash(name) == hashlib.sha256(common + module).hexdigest()[:12]
+
+
 def test_hash_normalises_line_endings() -> None:
     src = REPO / "src" / "driftlab" / "extraction"
     common, v1 = (src / "common.py").read_bytes(), (src / "v1.py").read_bytes()
@@ -507,8 +557,23 @@ RESPONSES = st.lists(_FRAGMENT, max_size=10).map("".join)
 _GOLDS = st.one_of(st.integers(-1_000, 10**6), st.fractions(max_denominator=8).map(canonical))
 
 
+def _assert_well_formed(text: str, ex: Extraction) -> None:
+    """Contract of every result: known method, value iff method != "none", span indexes the original text,
+    and the stored canonical string round-trips to the value."""
+    assert ex.method in METHODS
+    assert (ex.value is None) == (ex.method == "none"), (text, ex)
+    if ex.span is not None:
+        assert 0 <= ex.span[0] <= ex.span[1] <= len(text)
+        assert text[ex.span[0] : ex.span[1]] == ex.content, (text, ex)
+    if ex.value is not None:
+        assert ex.content is not None
+        assert gold_value(ex.extracted) == ex.value
+
+
 def _assert_monotone(text: str, golds: list) -> None:
     a, b = extract_v1(text), extract_v2(text)
+    _assert_well_formed(text, a)
+    _assert_well_formed(text, b)
     if a.value is not None:
         assert (b.value, b.method, b.span) == (a.value, a.method, a.span)
         golds = [*golds, a.value]
@@ -525,11 +590,25 @@ def test_monotone_on_marker_rich_texts(text: str, gold: object) -> None:
 @given(st.text(max_size=200), _GOLDS)
 @settings(derandomize=True, database=None, max_examples=500)
 def test_monotone_and_total_on_arbitrary_text(text: str, gold: object) -> None:
-    _assert_monotone(text, [gold])
-    for fn in (extract_v1, extract_v2):
-        ex = fn(text)
-        assert ex.method in METHODS
-        assert (ex.value is None) == (ex.method == "none")
+    _assert_monotone(text, [gold])  # also checks the result contract (incl. .extracted) for both
+
+
+def test_parse_lenient_agrees_with_strict_numbers_for_every_unicode_digit() -> None:
+    """v1's ``\\d`` is Unicode, so the monotonicity lemma must hold for every Nd code point, not only ASCII
+    (NFKC rewrites some digits, e.g. full-width / mathematical ones, and leaves others alone)."""
+    digit = re.compile(r"\d")
+    seen = 0
+    for cp in range(sys.maxunicode + 1):
+        c = chr(cp)
+        if not digit.fullmatch(c):
+            continue
+        seen += 1
+        s = f"-{c}7.{c}"
+        assert parse_lenient(s) == Fraction(Decimal(s)), hex(cp)
+        text = f"\\boxed{{{s}}}"
+        a, b = extract_v1(text), extract_v2(text)
+        assert a.value is not None and (b.value, b.method, b.span) == (a.value, a.method, a.span), hex(cp)
+    assert seen >= 600  # ~660 decimal digits in Unicode 14/15
 
 
 @given(st.from_regex(r"-?\d+(?:\.\d+)?", fullmatch=True))

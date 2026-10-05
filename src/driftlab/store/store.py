@@ -4,12 +4,14 @@ Write semantics per table (also used when shards are replayed, see ``store/shard
 
 * content-addressed / logical tables (``generations``, ``cells``, ``items``, ``prompts``, ``slots``,
   ``ledger``, ...) are insert-or-ignore on key conflicts (``ON CONFLICT DO NOTHING``, so NOT NULL / CHECK
-  violations still raise); ``slots`` additionally refuse a different ``prompt_hash`` for an existing slot
-  (determinism guard, :class:`SlotConflict`);
+  violations still raise); ``slots`` additionally refuse a different ``prompt_hash`` / lineage
+  (``created_round``, ``parent_slot``, ``origin``) for an existing slot (determinism guard,
+  :class:`SlotConflict`);
 * re-computable tables (``proposals``, ``trajectory_rounds``, ``stage_status``, ``audit_results``,
   ``analysis_results``, ``meta``) use ``INSERT OR REPLACE`` so idempotent re-runs converge;
 * ``scores`` are inserted once per ``(gen_key, extractor, gold)`` and only overwritten when the frozen
-  extractor's source hash (``ext_hash``) differs, so :meth:`Store.unscored` always terminates.
+  extractor's source hash (``ext_hash``) differs, so :meth:`Store.unscored` always terminates;
+* ``items`` refuse different content for an existing ``(split, idx)`` (:class:`ItemConflict`).
 
 Timestamps (``created_at`` ...) are ISO-8601 UTC strings; they never enter hashes or digests.
 """
@@ -68,7 +70,15 @@ class EngineMismatch(StoreError):
 
 
 class SlotConflict(StoreError):
-    """A slot already exists with a different prompt (the trajectory is not deterministic)."""
+    """A slot already exists with a different prompt or lineage (the trajectory is not deterministic)."""
+
+
+class ItemConflict(StoreError):
+    """A dataset item already exists with different content (the data snapshot or gold parser changed)."""
+
+
+class CellConflict(StoreError):
+    """A cell already exists with a different ``gen_key`` (the plan changed: nonce, seed, engine, prompt)."""
 
 
 def utc_now() -> str:
@@ -105,6 +115,8 @@ def _coerce(v: Any) -> Any:
         return v
     if isinstance(v, (list, tuple, dict, set, frozenset)):
         return to_json(v)
+    if getattr(v, "ndim", 0):  # numpy array (e.g. sampled error indices) -> JSON list
+        return to_json(v.tolist())
     if hasattr(v, "item"):  # numpy scalar
         return _coerce(v.item())
     if isinstance(v, Path):
@@ -272,8 +284,17 @@ class Store:
         """Insert rows with the table's conflict policy; returns the coerced rows (with assigned ids)."""
         allowed = set(self.table_columns(table))
         ts_col = TIMESTAMP_COLUMNS.get(table)
-        groups: dict[tuple[str, ...], list[tuple]] = {}
+        # Consecutive rows with the same column set are batched; input order is preserved across batches
+        # so "last row wins" holds for REPLACE tables even when rows carry different optional columns.
+        batch_cols: tuple[str, ...] | None = None
+        batch: list[tuple] = []
         out: list[dict] = []
+
+        def flush() -> None:
+            if batch:
+                self._conn.executemany(self._insert_sql(table, batch_cols or ()), batch)
+                batch.clear()
+
         for row in rows:
             r = {k: _coerce(v) for k, v in row.items()}
             unknown = set(r) - allowed
@@ -282,29 +303,59 @@ class Store:
             if ts_col is not None and not r.get(ts_col):
                 r[ts_col] = utc_now()
             if table in AUTOINC_TABLES and r.get("id") is None:
+                flush()
                 r.pop("id", None)
-                cols = tuple(r)
-                cur = self._conn.execute(self._insert_sql(table, cols), tuple(r.values()))
+                cur = self._conn.execute(self._insert_sql(table, tuple(r)), tuple(r.values()))
                 r["id"] = cur.lastrowid
             else:
-                groups.setdefault(tuple(r), []).append(tuple(r.values()))
+                if tuple(r) != batch_cols:
+                    flush()
+                    batch_cols = tuple(r)
+                batch.append(tuple(r.values()))
             out.append(r)
-        for cols, values in groups.items():
-            self._conn.executemany(self._insert_sql(table, cols), values)
+        flush()
         if table == "slots":
             self._check_slots(out)
+        elif table == "items":
+            self._check_items(out)
         return out
+
+    def _check_items(self, rows: list[dict]) -> None:
+        for r in rows:
+            got = self._conn.execute(
+                "SELECT question, answer_text, gold FROM items WHERE split=? AND idx=?",
+                (r["split"], r["idx"]),
+            ).fetchone()
+            if got is None:
+                continue
+            diff = [c for c in ("question", "answer_text", "gold") if c in r and str(got[c]) != str(r[c])]
+            if diff:
+                raise ItemConflict(
+                    f"item ({r['split']}, {r['idx']}) already stored with different {diff} "
+                    f"(stored gold {got['gold']!r}, new {r.get('gold')!r}); the data snapshot or gold parser "
+                    "changed — use a new run dir"
+                )
 
     def _check_slots(self, rows: list[dict]) -> None:
         for r in rows:
             got = self._conn.execute(
-                "SELECT prompt_hash FROM slots WHERE run_id=? AND seed=? AND slot=?",
+                "SELECT prompt_hash, created_round, parent_slot, origin FROM slots "
+                "WHERE run_id=? AND seed=? AND slot=?",
                 (r["run_id"], r["seed"], r["slot"]),
             ).fetchone()
-            if got is not None and got[0] != r["prompt_hash"]:
+            if got is None:
+                continue
+            where = f"slot (run={r['run_id']}, seed={r['seed']}, slot={r['slot']})"
+            if got["prompt_hash"] != r["prompt_hash"]:
                 raise SlotConflict(
-                    f"slot (run={r['run_id']}, seed={r['seed']}, slot={r['slot']}) already holds prompt "
-                    f"{got[0][:12]}, refusing {str(r['prompt_hash'])[:12]} (non-deterministic trajectory?)"
+                    f"{where} already holds prompt {got['prompt_hash'][:12]}, refusing "
+                    f"{str(r['prompt_hash'])[:12]} (non-deterministic trajectory?)"
+                )
+            diff = [c for c in ("created_round", "parent_slot", "origin") if c in r and got[c] != r[c]]
+            if diff:
+                raise SlotConflict(
+                    f"{where} already stored with different {diff}: "
+                    f"{[got[c] for c in diff]} vs {[r[c] for c in diff]} (non-deterministic trajectory?)"
                 )
 
     def write_tables(
@@ -327,6 +378,8 @@ class Store:
                 with self.transaction():
                     written = {t: self._insert_rows(t, rows) for t, rows in payload.items() if rows}
                     if shard_writer is not None and written:
+                        # several writer instances may share one store: never reuse a committed seq
+                        shard_writer.advance_to(int(self.get_meta("last_shard_seq") or 0) + 1)
                         shard = shard_writer.write(stage, written)
                         seq, path, n_rows, sha = shard
                         self._record_shard(seq, Path(path).name, n_rows, sha)
@@ -454,6 +507,11 @@ class Store:
                 self._conn.execute(f"UPDATE runs SET {sets} WHERE run_id = ?", (*updates.values(), run_id))
             return self.get_run(run_id)  # type: ignore[return-value]
 
+    def mark_synthetic(self, run_id: str) -> None:
+        """Set the sticky ``runs.synthetic`` flag (no-op if the run row does not exist)."""
+        with self.transaction():
+            self._conn.execute("UPDATE runs SET synthetic = 1 WHERE run_id = ? AND synthetic = 0", (run_id,))
+
     def get_run(self, run_id: str | None = None) -> dict | None:
         """The run row; with ``run_id=None`` the only run (``None`` if empty, ``LookupError`` if several)."""
         if run_id is not None:
@@ -467,18 +525,39 @@ class Store:
         return self.query("SELECT * FROM runs ORDER BY created_at, run_id")
 
     # ------------------------------------------------------------------ items & prompts
-    def put_items(self, split: str, rows: Iterable[Mapping[str, Any]]) -> None:
-        """Insert dataset items (``idx, question, answer_text, gold``); idempotent."""
-        with self.transaction():
-            self._insert_rows("items", [{**dict(r), "split": split} for r in rows])
+    def put_items(
+        self,
+        split: str,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        shard_writer: ShardWriter | None = None,
+        stage: str = "items",
+    ) -> None:
+        """Insert dataset items (``idx, question, answer_text, gold``); idempotent.
+
+        Raises ``ValueError`` if a row names another split (e.g. eval items passed as ``"train"``) and
+        :class:`ItemConflict` if an item is already stored with different content.
+        """
+        out = []
+        for r in rows:
+            row = dict(r)
+            if row.get("split", split) != split:
+                raise ValueError(f"item {row.get('idx')} belongs to split {row['split']!r}, not {split!r}")
+            out.append({**row, "split": split})
+        self.write_tables({"items": out}, shard_writer=shard_writer, stage=stage)
 
     def get_items(self, split: str) -> list[dict]:
         return self.query("SELECT * FROM items WHERE split = ? ORDER BY idx", (split,))
 
-    def put_prompt(self, text: str) -> str:
+    def put_prompt(
+        self, text: str, *, shard_writer: ShardWriter | None = None, stage: str = "prompts"
+    ) -> str:
+        """Store a prompt text (meta-prompts, parsed candidates, ...); returns its sha256. Pass
+        ``shard_writer`` for prompts referenced by sharded rows (e.g. ``proposals.meta_prompt_hash``)."""
         h = sha256_text(text)
-        with self.transaction():
-            self._insert_rows("prompts", [{"prompt_hash": h, "text": text}])
+        self.write_tables(
+            {"prompts": [{"prompt_hash": h, "text": text}]}, shard_writer=shard_writer, stage=stage
+        )
         return h
 
     def get_prompt(self, prompt_hash: str) -> str | None:
@@ -577,14 +656,14 @@ class Store:
         self,
         generations: Sequence[Mapping[str, Any]],
         cells: Sequence[Mapping[str, Any]],
-        ledger: Mapping[str, Any] | None,
+        ledger: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
         shard_writer: ShardWriter | None = None,
         stage: str = "",
     ) -> None:
-        """Commit one engine chunk (generations + cells + ledger row [+ shard]) in ONE transaction."""
+        """Commit one engine chunk (generations + cells + ledger row(s) [+ shard]) in ONE transaction."""
         payload: dict[str, Sequence[Mapping[str, Any]]] = {"generations": generations, "cells": cells}
         if ledger is not None:
-            payload["ledger"] = [ledger]
+            payload["ledger"] = [ledger] if isinstance(ledger, Mapping) else list(ledger)
         self.write_tables(payload, shard_writer=shard_writer, stage=stage)
 
     def existing_cell_keys(
@@ -601,6 +680,24 @@ class Store:
             params.append(seed)
         with self._lock:
             return {tuple(r) for r in self._conn.execute(sql, params)}
+
+    def lookup_cells(self, run_id: str, cell_keys: Iterable[Sequence[Any]]) -> dict[tuple, dict]:
+        """Existing cells by key ``(seed, split, decoding_id, slot, draw_kind, draw, item_idx)`` ->
+        ``{gen_key, physical}``; one indexed query per (seed, split, decoding, slot, draw) column."""
+        groups: dict[tuple, set[int]] = {}
+        for k in cell_keys:
+            groups.setdefault(tuple(k[:6]), set()).add(int(k[6]))
+        out: dict[tuple, dict] = {}
+        with self._lock:
+            for prefix, items in groups.items():
+                for r in self._conn.execute(
+                    "SELECT item_idx, gen_key, physical FROM cells WHERE run_id = ? AND seed = ? AND split = ? "
+                    "AND decoding_id = ? AND slot = ? AND draw_kind = ? AND draw = ?",
+                    (run_id, *prefix),
+                ):
+                    if r["item_idx"] in items:
+                        out[(*prefix, r["item_idx"])] = {"gen_key": r["gen_key"], "physical": r["physical"]}
+        return out
 
     def get_cells(self, run_id: str, split: str | None = None, seed: int | None = None) -> list[dict]:
         """Cell rows (cell columns only), ordered by the cell key."""
@@ -728,6 +825,8 @@ class Store:
         Safe while WAL is active; the snapshot is converted to rollback-journal mode so it is one file.
         """
         dest = Path(dest_path)
+        if str(self._path) != ":memory:" and dest.resolve() == self._path.resolve():
+            raise StoreError(f"backup_to() target {dest} is the live database itself")
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".tmp")
         for p in (tmp, Path(f"{tmp}-wal"), Path(f"{tmp}-shm"), Path(f"{tmp}-journal")):
@@ -746,12 +845,14 @@ class Store:
 
     def content_digest(self, run_id: str) -> str:
         """sha256 over the deterministic content: generations (all columns except latency, batch id and
-        timestamps), the run's cells, scores, slots, proposals and trajectory rounds (minus timestamps).
+        timestamps), prompts, the run's cells, scores, slots, proposals and trajectory rounds (minus
+        timestamps).
 
         Ledger rows, shard bookkeeping and timestamps are excluded, so an interrupted + resumed run, a
         restored snapshot + shard replay and an uninterrupted run all have the same digest.
         """
         parts: list[tuple[str, str, tuple]] = [
+            ("prompts", "SELECT prompt_hash, text FROM prompts ORDER BY prompt_hash", ()),
             (
                 "generations",
                 "SELECT gen_key, engine_fp, model_id, model_revision, rendered_sha, system_hash, user_hash, "

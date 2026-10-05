@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -21,6 +22,7 @@ from driftlab.backends.hf import (
     RenderCache,
     effective_seed,
     format_capability,
+    package_version,
     render_chat,
     resolve_dtype_name,
     stop_token_ids,
@@ -28,6 +30,8 @@ from driftlab.backends.hf import (
 from driftlab.config import VLLMSection
 
 LLM_SEED = 0
+# Environment overrides that switch vLLM's engine / attention kernels without any version change.
+ENGINE_ENV_VARS: tuple[str, ...] = ("VLLM_USE_V1", "VLLM_ATTENTION_BACKEND")
 
 
 def _device_info() -> dict[str, Any] | None:
@@ -156,6 +160,9 @@ class VLLMBackend(Backend):
             "kind": "vllm",
             "vllm": str(getattr(self._vllm, "__version__", "unknown")),
             "torch": _torch_version(),
+            "transformers": package_version("transformers"),  # chat template + tokenizer code
+            "tokenizers": package_version("tokenizers"),
+            "env": {k: os.environ.get(k) for k in ENGINE_ENV_VARS},
             "dtype": self._effective_dtype(),
             "gpu_class": self.gpu_class,
             "capability": format_capability(self.capability),

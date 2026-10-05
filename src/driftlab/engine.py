@@ -8,12 +8,21 @@
 3. generate the missing keys in order of first appearance, in chunks of ``chunk_size``;
 4. per chunk, ONE store transaction writes the new generations, every cell whose generation is now
    available (cache-hit cells go with the first chunk, or a final zero-generation chunk) and one ledger row
-   (requested = logical tasks, executed = cache misses), plus one immutable shard file if configured.
+   (requested = logical tasks, executed = cache misses; backend errors get an extra ``"<stage>:error"``
+   row), plus one immutable shard file if configured.
 
 Budget checks (deadline, injected failure) run *between* chunks, after the previous chunk committed, so a
 crash loses at most the chunk in flight and a re-run of the same tasks converges to the same store. They
 run only before chunks that call the backend and count only such chunks: an all-cache-hit call is free and
 always completes, so re-submitting finished work after a crash can never starve progress.
+
+Integrity guards (checked before any model call): a sampling request must carry an explicit seed (an
+unseeded sample would be cached and silently reused by every "independent" draw); a cell's
+``decoding_id`` must match its request; one call may not map a cell to two generations; a cell already in
+the store with a different ``gen_key`` raises :class:`~driftlab.store.store.CellConflict` (cells are
+first-write-wins, so the new generation would be paid for but never reach the cube); and the engine
+fingerprint must match the run's stored ``engine_fp``. A synthetic backend (mock) always marks the run
+``synthetic`` (sticky), even if the caller forgot to.
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from typing import Any
 from driftlab.backends.base import Backend, GenRequest, GenResult
 from driftlab.keys import engine_fingerprint, gen_key, sha256_text
 from driftlab.store.shards import ShardWriter
-from driftlab.store.store import Store, utc_now
+from driftlab.store.store import CellConflict, EngineMismatch, Store, utc_now
 
 FAIL_AFTER_ENV = "DRIFTLAB_FAIL_AFTER_CHUNKS"
 
@@ -74,7 +83,8 @@ class InjectedFailure(Exception):
 
 
 class GenerationError(RuntimeError):
-    """The backend returned ``finish_reason == "error"``; such outputs are never cached."""
+    """The backend returned ``finish_reason == "error"``; such outputs are never cached (the rest of the
+    chunk is committed and the failed calls are logged in a ledger row with stage ``"<stage>:error"``)."""
 
 
 def decoding_json(request: GenRequest) -> str:
@@ -131,6 +141,49 @@ class GenerationEngine:
     def key_for(self, request: GenRequest) -> str:
         """The ``gen_key`` this engine would assign to ``request``."""
         return self._key(request, sha256_text(self.backend.render(request.system, request.user)))
+
+    # ------------------------------------------------------------------ guards
+    def _check_run(self) -> None:
+        """Engine fingerprint must match the run's; a synthetic backend always marks the run synthetic."""
+        row = self.store.get_run(self.run_id)
+        if row is None:
+            return
+        stored = row["engine_fp"]
+        if stored is not None and stored != self.engine_fp:
+            raise EngineMismatch(
+                f"run {self.run_id!r} is recorded with engine {stored}, this engine is {self.engine_fp} "
+                "(Store.ensure_run(..., allow_engine_change=True) records a deliberate change)"
+            )
+        if getattr(self.backend, "synthetic", False) and not row["synthetic"]:
+            self.store.mark_synthetic(self.run_id)
+
+    @staticmethod
+    def _check_task(i: int, task: CellTask, run_id: str) -> None:
+        req, c = task.request, task.cell
+        if not req.decoding.is_greedy and req.seed is None:
+            raise ValueError(
+                f"task {i}: sampling request (decoding {req.decoding.id!r}) without a seed; derive one via "
+                "driftlab.keys (an unseeded sample would be cached and reused by every draw)"
+            )
+        if c is None:
+            return
+        if c.run_id != run_id:
+            raise ValueError(f"task {i} belongs to run {c.run_id!r}, engine runs {run_id!r}")
+        if c.decoding_id != req.decoding.id:
+            raise ValueError(
+                f"task {i}: cell decoding {c.decoding_id!r} != request decoding {req.decoding.id!r}"
+            )
+
+    def _check_cells(self, cell_keys: dict[tuple, str]) -> None:
+        existing = self.store.lookup_cells(self.run_id, cell_keys)
+        bad = sorted(ck for ck, row in existing.items() if row["gen_key"] != cell_keys[ck])
+        if bad:
+            ck = bad[0]
+            raise CellConflict(
+                f"{len(bad)} cell(s) already stored with a different gen_key, e.g. {ck}: stored "
+                f"{existing[ck]['gen_key'][:12]}, requested {cell_keys[ck][:12]}. The plan changed (nonce, seed, "
+                "prompt, decoding, engine); cells are first-write-wins, so use a new run dir."
+            )
 
     # ------------------------------------------------------------------ budget
     def _check_budget(self) -> None:
@@ -196,13 +249,15 @@ class GenerationEngine:
         ``tasks``. Raises :class:`BudgetExhausted` / :class:`InjectedFailure` between chunks."""
         if not tasks:
             return []
+        for i, t in enumerate(tasks):
+            self._check_task(i, t, self.run_id)
+        self._check_run()
         keys: list[str] = []
         first: dict[str, int] = {}  # key -> index of the first task with that key
         rendered: dict[str, str] = {}  # key -> rendered prompt sha
         render_cache: dict[tuple[str, str], str] = {}
+        cell_keys: dict[tuple, str] = {}  # (seed, split, decoding_id, slot, draw_kind, draw, item) -> key
         for i, t in enumerate(tasks):
-            if t.cell is not None and t.cell.run_id != self.run_id:
-                raise ValueError(f"task {i} belongs to run {t.cell.run_id!r}, engine runs {self.run_id!r}")
             req = t.request
             rs = render_cache.get((req.system, req.user))
             if rs is None:
@@ -213,6 +268,12 @@ class GenerationEngine:
             if k not in first:
                 first[k] = i
                 rendered[k] = rs
+            c = t.cell
+            if c is not None:
+                ck = (c.seed, c.split, c.decoding_id, c.slot, c.draw_kind, c.draw, c.item_idx)
+                if cell_keys.setdefault(ck, k) != k:
+                    raise ValueError(f"task {i}: cell {ck} is requested twice with different generations")
+        self._check_cells(cell_keys)
 
         known = self.store.lookup_generations(first)
         missing = [k for k in first if k not in known]
@@ -229,7 +290,7 @@ class GenerationEngine:
                 self._check_budget()
             t0 = time.monotonic()
             gen_rows: list[dict[str, Any]] = []
-            failed: dict[str, str] = {}
+            failed: dict[str, GenResult] = {}
             if chunk:
                 reqs = [tasks[first[k]].request for k in chunk]
                 results = self.backend.generate(reqs)
@@ -238,7 +299,7 @@ class GenerationEngine:
                 batch_id = f"{stage}:{ci}"
                 for k, req, res in zip(chunk, reqs, results, strict=True):
                     if res.finish_reason == "error":
-                        failed[k] = res.text
+                        failed[k] = res
                         continue
                     row = self._generation_row(k, rendered[k], req, res, batch_id)
                     gen_rows.append(row)
@@ -275,14 +336,29 @@ class GenerationEngine:
                 "wall_s": time.monotonic() - t0,
                 "created_at": utc_now(),
             }
-            self.store.write_chunk(gen_rows, cells, ledger, shard_writer=self.shard_writer, stage=stage)
+            ledgers = [ledger]
+            if failed:  # paid-for model calls that produced no usable output: logged, never cached
+                n_fail_req = sum(keys[i] in failed for i in share[ci])
+                ledgers.append(
+                    {
+                        **ledger,
+                        "stage": f"{stage}:error",
+                        "n_requested": n_fail_req,
+                        "n_executed": len(failed),
+                        "n_cache_hits": n_fail_req - len(failed),
+                        "prompt_tokens": sum(int(r.n_prompt_tokens or 0) for r in failed.values()),
+                        "completion_tokens": sum(int(r.n_completion_tokens or 0) for r in failed.values()),
+                        "wall_s": 0.0,  # the chunk's wall time is already on the main row
+                    }
+                )
+            self.store.write_chunk(gen_rows, cells, ledgers, shard_writer=self.shard_writer, stage=stage)
             self.chunks_committed += 1
             self.chunks_executed += int(bool(chunk))
             self.n_requested += n_req
             self.n_executed += len(gen_rows)
             done += n_req
             if failed:
-                sample = next(iter(failed.values()))[:200]
+                sample = next(iter(failed.values())).text[:200]
                 raise GenerationError(
                     f"{len(failed)} generation(s) failed in chunk {ci} of stage {stage!r} (not cached; "
                     f"re-run to retry). First error: {sample}"

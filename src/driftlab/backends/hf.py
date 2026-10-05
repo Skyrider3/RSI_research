@@ -20,6 +20,7 @@ without torch and are shared with the vLLM and OpenAI-compatible backends.
 
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import re
 import time
@@ -90,6 +91,14 @@ def _version_tuple(version: str) -> tuple[int, ...]:
             break
         parts.append(int(m.group()))
     return tuple(parts)
+
+
+def package_version(name: str) -> str | None:
+    """Installed distribution version (without importing it), or None if absent."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def transformers_dtype_kwarg(version: str) -> str:
@@ -343,6 +352,7 @@ class HFBackend(Backend):
         return {
             "kind": "hf",
             "transformers": self._transformers.__version__,
+            "tokenizers": package_version("tokenizers"),  # tokenization of the rendered prompt
             "torch": self._torch.__version__,
             "dtype": self.dtype_name,
             "device": self.device_type,

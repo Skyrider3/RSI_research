@@ -11,10 +11,16 @@ Two rendering modes:
 
 ``base_url`` includes the API prefix, e.g. ``http://localhost:8000/v1``. Every decoding parameter is sent
 explicitly (temperature, top_p, max_tokens, n=1, seed for sampling only) plus the vLLM extensions
-``top_k`` (-1 = disabled) / ``repetition_penalty`` / ``stop_token_ids`` (disable with
-``vllm_extras=False``; ``extra_body`` is merged last). For vLLM servers prefer
-``vllm serve ... --generation-config vllm`` so unspecified fields never fall back to the checkpoint's
-generation_config.json.
+``top_k`` (-1 = disabled) / ``min_p`` (0 = disabled) / ``repetition_penalty`` / ``stop_token_ids`` and, in
+``chat_template`` mode, ``add_special_tokens: false`` (the rendered prompt already is the exact model input;
+vLLM's ``/completions`` would otherwise prepend a BOS for tokenizers that add one, unlike the HF backend).
+Disable them with ``vllm_extras=False``; ``extra_body`` is merged last. vLLM's server fills every *omitted*
+sampling field (including ``min_p``) from the checkpoint's generation_config.json, so all of them are sent.
+
+Server flags the client cannot enforce (launch vLLM accordingly; they are not visible in ``engine_info``):
+``vllm serve ... --generation-config vllm --no-enable-prefix-caching``. vLLM V1 enables prefix caching by
+default, which would let a physical rerun reuse the KV cache of the stored generation and bias measured
+rerun drift towards zero (the offline vLLM backend disables it for the same reason).
 
 Requests run concurrently (``asyncio.Semaphore(concurrency)``) with deterministic exponential backoff on
 429 / 5xx / transport errors (``Retry-After`` honoured). Exhausted retries and non-retryable HTTP errors
@@ -42,6 +48,7 @@ from driftlab.config import OpenAICompatSection
 RenderMode = Literal["auto", "chat_template", "messages_json"]
 RETRY_STATUS: frozenset[int] = frozenset({408, 409, 425, 429})
 VLLM_TOP_K_DISABLED = -1
+VLLM_MIN_P_DISABLED = 0.0
 _T = TypeVar("_T")
 
 
@@ -209,9 +216,12 @@ class OpenAICompatBackend(Backend):
             body["seed"] = seed
         if self.vllm_extras:
             body["top_k"] = int(d.top_k) if d.top_k > 0 else VLLM_TOP_K_DISABLED
+            body["min_p"] = VLLM_MIN_P_DISABLED  # omitted -> server falls back to generation_config.json
             body["repetition_penalty"] = float(d.repetition_penalty)
             if self.stop_ids:
                 body["stop_token_ids"] = list(self.stop_ids)
+            if self.render_mode == "chat_template":
+                body["add_special_tokens"] = False  # the rendered template is the exact model input
         body.update(self.extra_body)
         return body
 
@@ -261,7 +271,7 @@ class OpenAICompatBackend(Backend):
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 code = response.status_code
                 if code == 200:
-                    return self._parse(response, latency_ms)
+                    return self._parse(response, latency_ms, payload.get("max_tokens"))
                 last_error = f"HTTP {code}: {response.text[:500]}"
                 if code < 500 and code not in RETRY_STATUS:
                     return GenResult(text=f"{self.url} -> {last_error}", finish_reason="error")
@@ -272,7 +282,7 @@ class OpenAICompatBackend(Backend):
             finish_reason="error",
         )
 
-    def _parse(self, response: httpx.Response, latency_ms: float) -> GenResult:
+    def _parse(self, response: httpx.Response, latency_ms: float, max_tokens: Any = None) -> GenResult:
         try:
             data = response.json()
             choice = data["choices"][0]
@@ -289,10 +299,13 @@ class OpenAICompatBackend(Backend):
                 finish_reason="error",
             )
         usage = data.get("usage") or {}
+        n_completion = int(usage.get("completion_tokens") or 0)
+        if choice.get("finish_reason") is None and max_tokens and n_completion >= int(max_tokens):
+            finish = "length"  # a null finish_reason must not hide a truncation (truncation is reported)
         return GenResult(
             text=text,
             finish_reason=finish,
             n_prompt_tokens=int(usage.get("prompt_tokens") or 0),
-            n_completion_tokens=int(usage.get("completion_tokens") or 0),
+            n_completion_tokens=n_completion,
             latency_ms=latency_ms,
         )
