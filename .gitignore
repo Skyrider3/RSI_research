@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- driftlab ---
+runs/
+artifacts/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.hypothesis/

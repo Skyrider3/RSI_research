@@ -1,0 +1,5 @@
+# First thing to run on Colab: checks the GPU stack, calibrates throughput, confirms the trajectory moves.
+extends: full.yaml
+run: {name: colab_smoke, seeds: [0], rounds: 2}
+data: {dev: {split: train, n: 20}, eval: {split: test, n: 20}}
+audit: {repeats: 1, n_items: 20}

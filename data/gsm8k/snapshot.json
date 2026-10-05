@@ -1,0 +1,30 @@
+{
+  "dataset": "openai/gsm8k",
+  "config": "main",
+  "revision": "740312add88f781978c0658806c59bc2815b9866",
+  "source_files": {
+    "main/train-00000-of-00001.parquet": {
+      "sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d"
+    },
+    "main/test-00000-of-00001.parquet": {
+      "sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59"
+    }
+  },
+  "files": {
+    "train_first200.jsonl": {
+      "split": "train",
+      "n": 200,
+      "sha256": "1ef97704fd3504e130179780f6e152b79d29af3cc964c22bc7ca808de7383f69",
+      "source_rows": "0..199",
+      "n_rows_in_source_split": 7473
+    },
+    "test_first200.jsonl": {
+      "split": "test",
+      "n": 200,
+      "sha256": "bec6137436bbc61ee13eaba8ff8f78c7bd57c23ae963a1aa8306db3170835f90",
+      "source_rows": "0..199",
+      "n_rows_in_source_split": 1319
+    }
+  },
+  "selection": "first N rows of each split in the published order (no shuffling)"
+}

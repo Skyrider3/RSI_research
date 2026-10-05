@@ -1,0 +1,34 @@
+# Main experiment: exactly the proposal's fixed configuration (Table 1).
+run: {name: full, seeds: [0, 1, 2], rounds: 11}
+model: {id: Qwen/Qwen2.5-1.5B-Instruct, revision: 989aa7980e4cf806f80c7fef2b1adb7bc71aa306, dtype: auto, max_new_tokens: 640}
+backend: {kind: auto}            # auto -> vllm if importable, else hf (CUDA), else error
+data:
+  dataset: openai/gsm8k
+  config: main
+  revision: 740312add88f781978c0658806c59bc2815b9866
+  snapshot_dir: data/gsm8k
+  dev: {split: train, n: 200}
+  eval: {split: test, n: 200}
+decodings:
+  greedy: {temperature: 0.0, top_p: 1.0, top_k: 0, repetition_penalty: 1.0}
+  t02:    {temperature: 0.2, top_p: 1.0, top_k: 0, repetition_penalty: 1.0}
+environments:
+  E1: {decoding: greedy, extractor: v1, description: "Unchanged environment"}
+  E2: {decoding: t02,    extractor: v1, description: "Decoding change"}
+  E3: {decoding: greedy, extractor: v2, description: "Answer-extraction change"}
+  E4: {decoding: t02,    extractor: v2, description: "Multiple environment changes"}
+trajectory:
+  mode: dev_gated
+  env: E1
+  advance_rule: dev_gt
+  initial_prompt_file: initial_v1.txt
+  user_template: "{question}"
+  proposer: {temperature: 0.7, n_errors: 5, max_attempts: 3, template: meta_v1.txt}
+matrix:
+  mode: full
+  physical_greedy_reruns: ages   # physical (nonce) greedy reruns for the T7 ages; others are cache hits (flagged)
+  physical_ages: [0, 1, 3, 5, 10]
+  gt_draws: 1
+audit: {enabled: true, seed: 0, repeats: 2, decodings: [greedy, t02], n_items: 200}
+checkpoint: {drive_dir: null, snapshot_every_minutes: 20}
+analysis_plan: analysis_plans/prereg_v1.yaml

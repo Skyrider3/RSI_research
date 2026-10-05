@@ -1,0 +1,9 @@
+# CPU smoke test of the real HF backend with a tiny model. Violates the 640-token protocol on purpose (smoke: true).
+extends: full.yaml
+smoke: true
+run: {name: smoke_hf_cpu, seeds: [0], rounds: 1}
+model: {id: Qwen/Qwen2.5-0.5B-Instruct, revision: 7ae557604adf67be50417f59c2c2f167def9a775, dtype: float32, max_new_tokens: 48}
+backend: {kind: hf, hf: {batch_size: 4, device: cpu}}
+data: {dev: {split: train, n: 3}, eval: {split: test, n: 3}}
+trajectory: {proposer: {max_new_tokens: 48, max_attempts: 1, min_chars: 1}}
+audit: {enabled: false}

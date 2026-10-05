@@ -1,0 +1,6 @@
+# Tiny synthetic run used by CI and unit tests (seconds). SYNTHETIC: never report these numbers.
+extends: full.yaml
+run: {name: smoke_mock, seeds: [0, 1], rounds: 4}
+backend: {kind: mock}
+data: {dev: {split: train, n: 24}, eval: {split: test, n: 24}}
+audit: {repeats: 1, n_items: 24}

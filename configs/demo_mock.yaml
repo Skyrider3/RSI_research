@@ -1,0 +1,4 @@
+# Full-size synthetic demonstration (3 seeds x 11 rounds x 200 items) for the dashboard. SYNTHETIC DATA.
+extends: full.yaml
+run: {name: demo_mock}
+backend: {kind: mock, mock: {greedy_flip_rate: 0.004}}
