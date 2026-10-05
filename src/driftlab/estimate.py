@@ -20,12 +20,13 @@ Counts follow the planner rules of docs/ARCHITECTURE.md sections 3-4. Notation: 
 * Sampling eval (t02): T*N logical per seed; ``full`` -> all executed; ``lean`` -> K*N executed per seed.
 * GT draws (sampling decodings only): K*N*gt_draws per seed. Audit: slots * repeats * n_items * decodings.
 
+Physical greedy reruns carry the seed-specific nonce ``rerun:s{seed}:{r}``, so slot 0 (the same prompt in
+every seed) gets an independent rerun per seed and the per-seed count is exact.
+
 Remaining approximations (the ledger reports the truth after a run):
-* Physical greedy reruns of slot 0 carry the same nonce (``rerun:{r}``) in every seed and slot 0 is the same
-  prompt, so under the current key contract they share a gen_key across seeds; they are counted once per
-  seed here (over-count of at most (S-1)*R*N).
-* Candidate prompts are assumed distinct across seeds (no cross-seed cache hits); the audit assumes two
-  distinct slots and counts its t02 draws as executed.
+* Candidate prompts are assumed distinct across seeds (no cross-seed cache hits); the audit counts its
+  ``last_incumbent`` slot as distinct from slot 0 unless the config fixes the trajectory (``mode: static``
+  -> the last incumbent is slot 0), and counts its t02 draws as executed.
 
 Throughput figures (completion tokens/s, aggregate over large batches) are PLANNING ASSUMPTIONS; recalibrate
 with :func:`calibrate_from_ledger` on the ledger of a smoke run. Prefill time is not modelled separately.
@@ -203,6 +204,29 @@ def _greedy_rerun_cells(
     return S * hi, S * lo, f"physical at ages {ages}: {lo}..{hi} cells/seed depending on the trajectory"
 
 
+def audit_slot_count(cfg: ExperimentConfig) -> int:
+    """Distinct audited slots as far as the config determines them (``planning.audit_slots`` resolves them
+    after Phase A): ``first`` and explicit numbers resolve directly; ``last_incumbent`` is slot 0 under
+    ``trajectory.mode: static`` and is otherwise counted as a distinct slot (worst case)."""
+    resolved: set[int] = set()
+    unresolved: set[str] = set()
+    for name in cfg.audit.slots:
+        key = str(name).strip()
+        if key == "first":
+            resolved.add(0)
+        elif key in ("last_incumbent", "last"):
+            if cfg.trajectory.mode == "static":
+                resolved.add(0)
+            else:
+                unresolved.add("last_incumbent")
+        else:
+            try:
+                resolved.add(int(key))
+            except ValueError:
+                unresolved.add(key)
+    return len(resolved) + len(unresolved)
+
+
 def count_requests(
     cfg: ExperimentConfig,
     plan: AnalysisPlan | None = None,
@@ -300,7 +324,8 @@ def count_requests(
             )
     aud = cfg.audit
     if aud.enabled:
-        n_audit = len(set(aud.slots)) * aud.repeats * min(aud.n_items, N) * len(aud.decodings)
+        n_slots, n_aud_items = audit_slot_count(cfg), max(0, min(aud.n_items, N))
+        n_audit = n_slots * aud.repeats * n_aud_items * len(aud.decodings)
         rows.append(
             _row(
                 "audit",
@@ -308,8 +333,8 @@ def count_requests(
                 "determinism audit",
                 n_audit,
                 n_audit,
-                f"seed {aud.seed}: {len(set(aud.slots))} slots x {aud.repeats} repeats x "
-                f"{min(aud.n_items, N)} items x {len(aud.decodings)} decodings",
+                f"seed {aud.seed}: {n_slots} slot(s) x {aud.repeats} repeats x "
+                f"{n_aud_items} items x {len(aud.decodings)} decodings",
             )
         )
 
@@ -323,7 +348,6 @@ def count_requests(
             slot["executed_min"] += r["executed_min"]
     notes = [
         "throughput figures are planning assumptions; recalibrate with calibrate_from_ledger",
-        "slot-0 physical greedy reruns share gen_keys across seeds (nonce rerun:{r}); counted once per seed",
     ]
     if m.physical_greedy_reruns == "ages" and greedy_ids:
         notes.append(
@@ -584,6 +608,7 @@ __all__ = [
     "THROUGHPUT",
     "Estimate",
     "ages_rerun_bounds",
+    "audit_slot_count",
     "calibrate_from_ledger",
     "count_requests",
     "estimate",

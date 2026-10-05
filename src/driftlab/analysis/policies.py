@@ -504,15 +504,15 @@ def simulate(
     (``split_half`` is resolved to item halves when no items are given; explicit items must then come as both
     ``items`` and ``gt_items``, disjoint, else ``ValueError``). ``proposer_attempts`` maps round ->
     proposer attempts (used by conventions with ``proposer="attempts"``; missing rounds count 1).
-    Raises :class:`MissingCell` when a needed cell is absent.
+    Raises :class:`MissingCell` when a needed cell is absent (including slots beyond ``cube.n_slots``).
     """
     spec = parse_policy(policy)
     cost = get_convention(conv)
     envmap = as_environments(envs)
     sched = _as_schedule(schedule)
     seed, R, N = int(traj.seed), int(traj.R), int(cube.n_items)
-    if cube.n_slots < R + 1:
-        raise ValueError(f"cube has {cube.n_slots} slots but the trajectory needs {R + 1}")
+    if cube.n_slots < R + 1:  # the eval matrix does not cover the trajectory's later slots
+        raise MissingCell(f"cube has {cube.n_slots} slots but the trajectory of seed {seed} needs {R + 1}")
     dec_items, gt_idx, mode = _resolve_items(N, gt_mode, items, gt_items)
     env_at = [_env(envmap, sched.env_at(t)) for t in range(R + 1)]
     canon = _env(envmap, str(canonical_env))
@@ -756,7 +756,8 @@ def simulate_all(
     Uses ``plan.promotion_rule``, ``plan.gt`` (``split_half`` -> item halves), ``plan.cost_convention``
     (override with ``conv``) and ``plan.env_schedule()`` (override with ``schedule``). Runs are ordered
     policy-major, then by ``cube.seeds``. ``on_missing="skip"`` drops (with a warning) a (seed, policy)
-    whose cells are missing instead of raising :class:`MissingCell`.
+    whose cells are missing (:class:`MissingCell`, an extractor without score rows, a cube without the
+    trajectory's slots) instead of raising.
     """
     names = list(policies) if policies is not None else list(plan.policies)
     sched = _as_schedule(schedule if schedule is not None else plan.env_schedule())
@@ -789,7 +790,7 @@ def simulate_all(
                     items=items,
                     gt_items=gt_items,
                 )
-            except (MissingCell, IndexError) as e:
+            except (KeyError, IndexError) as e:  # MissingCell is a KeyError; unscored extractor -> KeyError
                 if on_missing != "skip":
                     raise
                 warnings.warn(f"policy {spec.name} seed {seed} skipped: {e}", stacklevel=2)

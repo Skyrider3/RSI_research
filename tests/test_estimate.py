@@ -14,6 +14,7 @@ from driftlab.estimate import (
     THROUGHPUT,
     Estimate,
     ages_rerun_bounds,
+    audit_slot_count,
     calibrate_from_ledger,
     count_requests,
     estimate,
@@ -207,6 +208,17 @@ def test_audit_and_gt_toggles() -> None:
     assert base["executed_total"] - no_audit["executed_total"] == 1600
     gt2 = count_requests(_load("full", ["matrix.gt_draws=2"]))
     assert gt2["executed_total"] - base["executed_total"] == 3 * 12 * 200
+
+
+def test_audit_slots_deduplicated_when_the_config_fixes_them() -> None:
+    # static: the last incumbent is always slot 0, so the audit covers one slot, not two
+    static = count_requests(_load("full", ["trajectory.mode=static"]))
+    assert static["by_purpose"]["audit"]["executed"] == 1 * 2 * 200 * 2
+    assert audit_slot_count(_load("full", ["trajectory.mode=static"])) == 1
+    assert audit_slot_count(_load("full")) == 2
+    assert audit_slot_count(_load("full", ["audit.slots=[first,'0',last,last_incumbent]"])) == 2
+    assert audit_slot_count(_load("full", ["audit.slots=[first,'3']"])) == 2
+    assert not any("rerun:{r}" in n for n in count_requests(_load("full"))["notes"])
 
 
 def test_expected_attempts_clamped() -> None:

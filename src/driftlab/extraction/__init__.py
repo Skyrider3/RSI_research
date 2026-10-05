@@ -4,6 +4,10 @@ The extractors are a research artifact: they define what counts as correct. Each
 hash (``extractor_hash``) over ``common.py`` plus its version module; ``scores.ext_hash`` and the environment
 fingerprints reference it, and ``tests/extractors_frozen.json`` pins it. A behavioural change therefore
 requires a NEW version module (``v3.py``) registered under a new name, never an edit of v1 / v2.
+
+Final semantics (fixed before any real experiment run): a ``####`` is a marker only when the rest of its
+line starts like a number (``is_hash_answer``; headings such as ``#### Step 4: Verify`` are ignored by both
+extractors), and v2's bold stage only reads number-like bold spans.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from driftlab.extraction.common import (
     find_boxes,
     gold_value,
     is_correct,
+    is_hash_answer,
     last_hash_line,
     parse_gold,
     parse_lenient,
@@ -48,6 +53,7 @@ __all__ = [
     "frozen_mismatches",
     "gold_value",
     "is_correct",
+    "is_hash_answer",
     "last_hash_line",
     "parse_gold",
     "parse_lenient",

@@ -3,11 +3,16 @@
 Everything that decides whether a response counts as correct lives in this module or in a version module
 (``v1.py``, ``v2.py``). Their source bytes are hashed into ``extractor_hash`` and every stored score
 references that hash, so this file must not change behaviour: a different rule becomes a NEW version
-(``v3.py``) instead.
+(``v3.py``) instead. (The semantics below were finalised before any real experiment run.)
 
 Marker selection is shared on purpose: both extractors first call :func:`select_marker` and read the same
 payload (:func:`marker_payload`), and :func:`parse_lenient` returns ``Fraction(Decimal(s))`` for every
 string ``s`` that v1 accepts. Hence v1-correct implies v2-correct (monotonicity), which the analyses rely on.
+
+A ``####`` is an answer marker only when the rest of its line, stripped, starts like a number
+(:data:`HASH_ANSWER_RE`, e.g. ``#### 42``, ``#### -3``, ``#### $1,234``, ``#### .5``); markdown headings
+(``#### Step 4: Verify``, ``#### Final Answer``) and empty ``####`` lines are ignored by BOTH extractors, and
+the LAST qualifying occurrence is used.
 """
 
 from __future__ import annotations
@@ -24,6 +29,13 @@ METHODS: tuple[str, ...] = ("boxed", "hash", "fbox", "answer_phrase", "bold", "l
 BOX_RE = re.compile(r"\\boxed\s*\{")
 FBOX_RE = re.compile(r"\\fbox\s*\{")
 HASH_MARK = "####"
+# A "####" qualifies as an answer marker iff HASH_ANSWER_RE.match(<rest of its line, stripped>): optional
+# sign, optional (escaped) dollar, optional minus, then a digit or '.' (whitespace allowed in between; empty
+# content does not qualify). Written without adjacent "\s*" runs, so long blank runs cannot cause
+# polynomial backtracking; it accepts exactly the strings of the spec pattern
+# r"[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*[\d.]" (an equivalence test pins this).
+HASH_ANSWER_RE = re.compile(r"[-+\u2212]?\s*(?:\\?\$\s*)?(?:[-\u2212]\s*)?[\d.]")
+_SPACE_RE = re.compile(r"\s*")  # same character class as str.strip() (Unicode whitespace)
 # A backslash escapes the next character (so "\{" and "\}" are literal); bare braces nest.
 _BRACE_TOKEN_RE = re.compile(r"\\.|[{}]", re.S)
 
@@ -188,19 +200,39 @@ def strip_span(content: str, start: int) -> tuple[str, Span]:
     return stripped, (start + lead, start + lead + len(stripped))
 
 
+def is_hash_answer(content: str) -> bool:
+    """Whether the rest of a ``####`` line qualifies as an answer (stripped, starts like a number)."""
+    return HASH_ANSWER_RE.match(content.strip()) is not None
+
+
 def _last_hash(text: str) -> tuple[int, str, Span] | None:
-    pos = text.rfind(HASH_MARK)
-    if pos < 0:
-        return None
-    line_start = pos + len(HASH_MARK)
-    nl = text.find("\n", line_start)
-    line_end = len(text) if nl < 0 else nl
-    content, span = strip_span(text[line_start:line_end], line_start)
-    return pos, content, span
+    """LAST qualifying ``####`` (occurrences scanned from the end): (marker start, stripped content, span).
+
+    Equivalent to testing ``is_hash_answer(text[pos + 4 : end_of_line])`` for every occurrence ``pos``
+    (overlapping ones included, so "##### 42" reads " 42"), but linear: each line's bounds are located once,
+    and the qualification test reads only the first non-blank characters of the rest of the line.
+    """
+    end = len(text)
+    line_start, line_end = end + 1, end
+    while (pos := text.rfind(HASH_MARK, 0, end)) >= 0:
+        start = pos + len(HASH_MARK)
+        if pos < line_start:  # first (= last) occurrence on a new line: locate the line once
+            nl = text.find("\n", start)
+            line_end = len(text) if nl < 0 else nl
+            line_start = text.rfind("\n", 0, pos) + 1
+        first = _SPACE_RE.match(text, start, line_end).end()  # endpos: never crosses the newline
+        if HASH_ANSWER_RE.match(text, first, line_end) is not None:
+            content, span = strip_span(text[start:line_end], start)
+            return pos, content, span
+        end = pos + len(HASH_MARK) - 1  # next occurrence starts before pos (overlaps allowed)
+    return None
 
 
 def last_hash_line(text: str) -> tuple[str, int, int] | None:
-    """The rest of the line after the LAST ``####`` (stripped) with its span, or ``None``."""
+    """The rest of the line after the LAST QUALIFYING ``####`` (stripped) with its span, or ``None``.
+
+    Headings (``#### Step 4: Verify``, ``#### Final Answer``) and empty ``####`` lines never qualify.
+    """
     h = _last_hash(text)
     if h is None:
         return None
@@ -218,7 +250,7 @@ def _last_box(text: str) -> tuple[int, str, Span] | None:
 
 
 def select_marker(text: str) -> Marker | None:
-    """Whichever of (last balanced box, last ``####`` line) starts later; content stripped.
+    """Whichever of (last balanced box, last QUALIFYING ``####`` line) starts later; content stripped.
 
     Both v1 and v2 call this first, which guarantees monotonicity (v1-correct implies v2-correct).
     """
@@ -231,7 +263,7 @@ def select_marker(text: str) -> Marker | None:
 
 
 def other_marker(text: str, kind: str) -> Marker | None:
-    """The marker of the other kind (last box if ``kind == "hash"``, else the last ``####`` line)."""
+    """The marker of the other kind (last box if ``kind == "hash"``, else the last qualifying ``####`` line)."""
     found = _last_box(text) if kind == "hash" else _last_hash(text)
     if found is None:
         return None

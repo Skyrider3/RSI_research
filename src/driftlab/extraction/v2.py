@@ -4,8 +4,14 @@
    (the last box if the ``####`` line was selected, or vice versa)            -> "boxed" / "hash"
 2. the last balanced ``\\fbox{...}``                                            -> "fbox"
 3. the last "(final) answer is / : / =" phrase                                -> "answer_phrase"
-4. the last ``**bold**`` / ``__bold__`` span whose content parses              -> "bold"
+4. the last ``**bold**`` / ``__bold__`` span whose stripped content is
+   number-like (``BOLD_NUMERIC_RE``)                                          -> "bold"
 5. the last number in the NFKC-normalised response                            -> "last_number"
+
+Only QUALIFYING ``####`` lines are markers (shared rule, ``common.HASH_ANSWER_RE``): a heading such as
+``#### Step 3`` or ``#### Final Answer`` is not a marker, so the later stages decide. The bold stage accepts
+``**42**``, ``**$1,234**``, ``**18 dollars**``, ``**25%**``, ``**x = 18**``, ``**3.5 hours.**``, ``**-7**``
+and skips step headers / equations such as ``**Step 3: Add the parts**`` or ``**Total = 5 + 13 = 18**``.
 
 Because stage 1 reads exactly the payload v1 reads and ``parse_lenient`` agrees with v1 on every string v1
 accepts, v1-correct implies v2-correct.
@@ -32,6 +38,15 @@ ANSWER_PHRASE_RE = re.compile(
     r"(?i)\b(?:final\s+answer|the\s+answer|answer)\b[^\n\d-]{0,20}?(?:is|:|=)\s*(?P<rest>[^\n]{0,80})"
 )
 BOLD_RES = (re.compile(r"\*\*([^*\n]{1,40})\*\*"), re.compile(r"__([^_\n]{1,40})__"))
+# Number-like bold content: optional "x =", sign, (escaped) dollar, minus; a number (thousands commas,
+# decimals, leading-dot decimals); optional "%" or one/two unit words; optional final '.'/'!'. Written
+# without adjacent "\s*" runs; it accepts exactly the strings of the spec pattern
+# r"^\s*(?:[A-Za-z]\s*=\s*)?[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)\s*"
+# r"(?:\\?%|[A-Za-z]+(?:\s+[A-Za-z]+)?)?\s*[.!]?\s*$" (an equivalence test pins this).
+BOLD_NUMERIC_RE = re.compile(
+    r"^\s*(?:[A-Za-z]\s*=\s*)?(?:[-+\u2212]\s*)?(?:\\?\$\s*)?(?:[-\u2212]\s*)?(?:\d[\d,]*(?:\.\d+)?|\.\d+)\s*"
+    r"(?:(?:\\?%|[A-Za-z]+(?:\s+[A-Za-z]+)?)\s*)?(?:[.!]\s*)?$"
+)
 
 
 def _from_marker(text: str) -> Extraction | None:
@@ -74,9 +89,12 @@ def _from_answer_phrase(text: str) -> Extraction | None:
 def _from_bold(text: str) -> Extraction | None:
     spans = sorted((m.span(1) for rx in BOLD_RES for m in rx.finditer(text)), reverse=True)
     for start, end in spans:
-        value = parse_lenient(text[start:end])
+        content, span = strip_span(text[start:end], start)
+        if BOLD_NUMERIC_RE.match(content) is None:  # step headers, equations, prose
+            continue
+        value = parse_lenient(content)
         if value is not None:
-            return Extraction(value, "bold", (start, end), text[start:end])
+            return Extraction(value, "bold", span, content)
     return None
 
 

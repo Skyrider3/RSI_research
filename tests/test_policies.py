@@ -10,7 +10,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from driftlab.analysis.cube import empty_cube, make_trajectory, set_cell
+from driftlab.analysis.cube import MissingCell, empty_cube, make_trajectory, set_cell
 from driftlab.analysis.metrics import mean_sd, paired, wilson
 from driftlab.analysis.policies import (
     CALL_PURPOSES,
@@ -524,6 +524,38 @@ def test_missing_cells_raise_or_skip():
     with pytest.warns(UserWarning):
         out = simulate_all(cube, trajs, AnalysisPlan(), ENVS, 20, policies=["P1"], on_missing="skip")
     assert out == []
+
+
+def test_short_cube_and_unscored_extractor_are_missing_cells():
+    """A trajectory longer than the eval matrix raises MissingCell (not ValueError), and an extractor without
+    score rows is skipped like any missing cell under on_missing='skip'."""
+    cube = random_cube(R=3, N=20, seeds=(0,), tag="short")
+    with pytest.raises(MissingCell):
+        simulate(cube, traj(0, 5), TEAMMATE_SCHEDULE, ENVS, "P1", RULE)
+    with pytest.warns(UserWarning):
+        assert simulate_all(cube, {0: traj(0, 5)}, AnalysisPlan(), ENVS, 20, on_missing="skip") == []
+    full = random_cube(R=4, N=20, seeds=(0,), tag="v1only")
+    cube = empty_cube("test", (0,), ["greedy", "t02"], ["v1"], 5, full.draws, 20)  # nothing scored with v2
+    for d in ("greedy", "t02"):
+        for k in range(5):
+            for draw in full.draws:
+                if full.has(0, d, k, draw):
+                    set_cell(cube, 0, d, k, draw, {"v1": full.vec(0, d, k, draw, "v1")}, physical=True)
+    e3 = EnvSchedule({0: "E1", 2: "E3"})  # rounds 2..4 need v2 scores
+    with pytest.raises(KeyError):
+        simulate_all(cube, {0: traj(0, 4)}, AnalysisPlan(), ENVS, 20, policies=["P5"], schedule=e3)
+    with pytest.warns(UserWarning):
+        out = simulate_all(
+            cube,
+            {0: traj(0, 4)},
+            AnalysisPlan(),
+            ENVS,
+            20,
+            policies=["P1", "P5"],
+            schedule=e3,
+            on_missing="skip",
+        )
+    assert out == []  # every policy scores the round-2.. candidates with v2
 
 
 # --------------------------------------------------------------------------- T5 candidates

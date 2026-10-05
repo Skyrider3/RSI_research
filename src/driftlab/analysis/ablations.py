@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,9 @@ ABLATION_COLUMNS: tuple[str, ...] = (
     "n_accepted_P3",
     "gt_acc_P3",
     "calls_P3",
+    "n_accepted_gt_coupled_P1",
+    "n_accepted_gt_coupled_P1b",
+    "n_accepted_gt_coupled_P3",
 )
 
 SCHEDULE_RANDOM_COLUMNS: tuple[str, ...] = (
@@ -107,6 +111,11 @@ def _far_stats(runs: Sequence[PolicyRun]) -> tuple[float, float, int]:
     return pooled, (float(np.mean(per_seed)) if per_seed else float("nan")), int(n_acc)
 
 
+def _coupled(runs: Sequence[PolicyRun]) -> int:
+    """Accepts (summed over seeds) whose decision reused the incumbent's own GT cells: never false accepts."""
+    return int(sum(r.n_accepted_gt_coupled for r in runs))
+
+
 def _mean_calls(runs: Sequence[PolicyRun]) -> float | int:
     vals = [r.total_calls for r in runs]
     if not vals:
@@ -124,6 +133,7 @@ def run_ablations(
     extractor_tags: Mapping[str, str] | None = None,
     *,
     proposer_attempts_by_seed: Mapping[int, Mapping[int, int]] | None = None,
+    on_missing: Literal["raise", "skip"] = "raise",
 ) -> pd.DataFrame:
     """T8: one row per ablation of ``plan.ablations`` (plan order); columns :data:`ABLATION_COLUMNS`.
 
@@ -135,8 +145,10 @@ def run_ablations(
     * The P3 slot holds ``FIXEDAGE_k<fixed_age>`` for ablations with ``fixed_age`` (named in ``p3_policy``);
       ``gt_acc_P3`` (canonical env, mean over seeds) and ``calls_P3`` (mean total calls; int when constant)
       come from that policy. ``reference_age_variation`` is False exactly when ``fixed_age`` is set.
+    * ``n_accepted_gt_coupled_*``: accepts (summed over seeds) decided against the shadow incumbent's own GT
+      cells (greedy), which cannot be false accepts; reporting marks a FAR made only of them with ‡.
     * ``proposer_attempts_by_seed`` is forwarded to :func:`simulate_all` (needed for exact ``calls_P3`` under
-      the ``full`` convention, which counts every proposer attempt).
+      the ``full`` convention, which counts every proposer attempt), and so is ``on_missing``.
     """
     envmap = as_environments(envs)
     tmap = as_trajectories(trajs)
@@ -163,6 +175,7 @@ def run_ablations(
             proposer_attempts_by_seed=proposer_attempts_by_seed,
             policies=["P1", "P1b", third],
             schedule=sched,
+            on_missing=on_missing,
         )
         by_pol: dict[str, list[PolicyRun]] = {}
         for r in runs:
@@ -199,6 +212,9 @@ def run_ablations(
                     else float("nan")
                 ),
                 "calls_P3": _mean_calls(third_runs),
+                "n_accepted_gt_coupled_P1": _coupled(by_pol.get("P1", [])),
+                "n_accepted_gt_coupled_P1b": _coupled(by_pol.get("P1b", [])),
+                "n_accepted_gt_coupled_P3": _coupled(third_runs),
             }
         )
     if not rows:
@@ -256,6 +272,7 @@ def schedule_randomization_frame(
     *,
     n: int | None = None,
     proposer_attempts_by_seed: Mapping[int, Mapping[int, int]] | None = None,
+    on_missing: Literal["raise", "skip"] = "raise",
 ) -> pd.DataFrame:
     """EXPLORATORY: one row per (schedule_id, seed, policy) over random schedules.
 
@@ -286,6 +303,7 @@ def schedule_randomization_frame(
             proposer_attempts_by_seed=proposer_attempts_by_seed,
             policies=list(policies),
             schedule=sched,
+            on_missing=on_missing,
         )
         text = format_schedule(ch)
         changes = ",".join(str(r) for r in sched.change_rounds())

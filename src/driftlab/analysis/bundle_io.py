@@ -3,7 +3,8 @@
 On disk (``runs/<run>/exports/analysis/``)::
 
     bundle.json          meta (see ``AnalysisBundle.meta`` keys below) + list of frame names
-    <frame>.csv          one CSV per frame (UTF-8, index not written)
+    <frame>.csv          one CSV per frame (UTF-8, index not written; missing values written as ``NaN`` so
+                         that an empty string round-trips as ``""``, see ``CSV_NA_REP``)
 
 Frames (``AnalysisBundle.frames``) and their producers. Column lists marked *required* are relied on by
 reporting/tables.py and the dashboard; producers may add more columns.
@@ -56,6 +57,15 @@ BY_CONSTRUCTION_NOTE = (
     "‡ identical by construction: the compared values come from the same physical generation / the same cells, "
     "so a zero here is a property of the measurement design, not a measured effect."
 )
+
+# Missing values are written as CSV_NA_REP (bundle.json records it as "csv_na_rep"), and read back with every
+# pandas default NA token EXCEPT the empty string, so "" (e.g. environments.changed_vs_storage of the storage
+# env, ORACLE ref ids) survives the round trip. Bundles without the marker are read with pandas defaults.
+CSV_NA_REP = "NaN"
+_CSV_NA_VALUES: tuple[str, ...] = (
+    "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA",
+    "NULL", "NaN", "None", "n/a", "nan", "null",
+)  # fmt: skip
 
 FRAME_NAMES: tuple[str, ...] = (
     "pairs",
@@ -127,9 +137,9 @@ def save_bundle(bundle: AnalysisBundle, run_dir: str | Path) -> Path:
     for name, df in bundle.frames.items():
         if df is None:
             continue
-        df.to_csv(out / f"{name}.csv", index=False)
+        df.to_csv(out / f"{name}.csv", index=False, na_rep=CSV_NA_REP)
         names.append(name)
-    index = {"meta": bundle.meta, "frames": sorted(names)}
+    index = {"meta": bundle.meta, "frames": sorted(names), "csv_na_rep": CSV_NA_REP}
     tmp = out / (BUNDLE_INDEX + ".tmp")
     tmp.write_text(json.dumps(index, indent=2, default=_json_default, sort_keys=True))
     tmp.replace(out / BUNDLE_INDEX)
@@ -141,12 +151,16 @@ def load_bundle(run_dir: str | Path) -> AnalysisBundle:
     d = bundle_dir(run_dir)
     index = json.loads((d / BUNDLE_INDEX).read_text())
     frames: dict[str, pd.DataFrame] = {}
+    na = index.get("csv_na_rep")
+    opts: dict[str, Any] = (
+        {} if na is None else {"keep_default_na": False, "na_values": [*_CSV_NA_VALUES, na]}
+    )
     for name in index.get("frames", []):
         path = d / f"{name}.csv"
         if not path.exists():
             continue
         try:
-            frames[name] = pd.read_csv(path)
+            frames[name] = pd.read_csv(path, **opts)
         except pd.errors.EmptyDataError:
             frames[name] = pd.DataFrame()
     return AnalysisBundle(meta=index.get("meta", {}), frames=frames)
