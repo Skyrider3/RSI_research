@@ -59,6 +59,13 @@ class OpenAICompatSection(_Model):
     concurrency: int = 16
     timeout_s: float = 600.0
     served_model_name: str | None = None  # defaults to model.id
+    render_mode: Literal["auto", "chat_template", "messages_json"] = "auto"
+    vllm_extras: bool = True  # send top_k / repetition_penalty / stop_token_ids (vLLM extensions)
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+    # Free-text description of the SERVER's engine (e.g. "vllm-0.10.1/A100/bf16/no-prefix-cache"). It is part of
+    # the engine fingerprint instead of base_url, so a new tunnel URL does not invalidate the cache while a
+    # different server engine does. The client cannot see the server's engine: keep this accurate.
+    server_tag: str = ""
 
 
 class MockSection(_Model):

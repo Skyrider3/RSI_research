@@ -57,6 +57,10 @@ class Cube:
     gen_keys: list[str] = field(default_factory=list)
     greedy_decodings: frozenset[str] = frozenset({"greedy"})
     synthetic: bool = False
+    # Optional (S, D, K, R, N) int32 ids of distinct response TEXTS (-1 = missing). Two physically distinct
+    # generations (different gen_key, e.g. a nonce rerun) may still produce byte-identical text; that is a
+    # *measured* reproduction, unlike a shared gen_row which is identical *by construction*.
+    text_row: np.ndarray | None = None
 
     # ---------------------------------------------------------------- index helpers
     def __post_init__(self) -> None:
@@ -119,6 +123,18 @@ class Cube:
         if not ok.any():
             return float("nan")
         return float((ga[ok] == gb[ok]).mean())
+
+    def same_text_frac(self, a: tuple[int, str, int, Draw], b: tuple[int, str, int, Draw]) -> float:
+        """Fraction of items on which two cells produced byte-identical response text (NaN if unknown)."""
+        if self.text_row is None:
+            return float("nan")
+        sa, da, ka, ra = self._idx(*a)
+        sb, db, kb, rb = self._idx(*b)
+        ta, tb = self.text_row[sa, da, ka, ra], self.text_row[sb, db, kb, rb]
+        ok = (ta >= 0) & (tb >= 0)
+        if not ok.any():
+            return float("nan")
+        return float((ta[ok] == tb[ok]).mean())
 
     def is_physical(self, seed: int, decoding: str, slot: int, draw: Draw) -> bool:
         s, d, k, r = self._idx(seed, decoding, slot, draw)

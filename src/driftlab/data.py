@@ -55,7 +55,7 @@ def canonical_number(s: str) -> str:
     return format(d.normalize(), "f")
 
 
-def parse_gold(answer_text: str) -> str:
+def canonical_gold(answer_text: str) -> str:
     """Canonical gold of a GSM8K reference solution: the number after the last ``####``."""
     if "####" not in answer_text:
         raise ValueError("GSM8K answer has no '####' marker")
@@ -213,7 +213,7 @@ def _item_from_row(row: Mapping[str, Any], split: str, pos: int, origin: str) ->
         raise DataIntegrityError(f"{origin}: row {pos} has idx {idx} (rows must be in published order)")
     question, answer = str(row["question"]), str(row["answer"])
     try:
-        gold = parse_gold(answer)
+        gold = canonical_gold(answer)
     except ValueError as e:
         raise DataIntegrityError(f"{origin}: row {pos}: {e}") from None
     if "gold" in row:
@@ -398,7 +398,7 @@ __all__ = [
     "load_eval",
     "load_items",
     "load_split",
-    "parse_gold",
+    "canonical_gold",
     "snapshot_info",
     "user_message",
 ]

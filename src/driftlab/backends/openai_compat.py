@@ -174,7 +174,9 @@ class OpenAICompatBackend(Backend):
     def engine_info(self) -> dict:
         return {
             "kind": "openai_compat",
-            "base_url": self.base_url,
+            # base_url is deliberately NOT fingerprinted (tunnel URLs change between Colab sessions);
+            # the user-declared server_tag identifies the server-side engine instead.
+            "server_tag": getattr(self.settings, "server_tag", ""),
             "served_model": self.served_model,
             "render": self.render_mode,
             "endpoint": self.endpoint,

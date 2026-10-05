@@ -38,7 +38,8 @@ src/driftlab/
   config.py            ExperimentConfig, AnalysisPlan, load_config(path, overrides), load_plan(path)   [DONE]
   environments.py      Decoding, Environment, EnvSchedule, diff(), build_environments()                [DONE]
   keys.py              gen_key(), sample_seed(), proposer_seed(), rng_seed(), engine_fingerprint()        [DONE]
-  data.py              Item, load_split(cfg, which="dev"|"eval") -> DevSplit|EvalSplit, parse_gold
+  data.py              Item, load_dev/load_eval -> DevSplit|EvalSplit, canonical_gold(answer) -> str (items.gold)
+                       (extraction.parse_gold(answer) -> Fraction is the numeric twin used for scoring)
   extraction/          common.py, v1.py, v2.py, __init__ (REGISTRY, extract(name, text), tags, is_correct)
   backends/            base.py [DONE], mock.py, hf.py, gumbel.py, vllm_backend.py, openai_compat.py,
                        __init__.make_backend(cfg, answer_key=None)
@@ -98,10 +99,11 @@ which cells are physically distinct generations:
 * For every seed s, decoding d ∈ {greedy, t02}, slot k, round r ∈ [k, R]: cell `(s,'test',d,k,('round',r))`.
 * **greedy**: request seed = None. Nonce = None (cache hit on the creation generation) except where the cell
   is physical:
-  * `physical_greedy_reruns: all` → every r > k gets `nonce = f"rerun:{r}"`.
+  * `physical_greedy_reruns: all` → every r > k gets `nonce = f"rerun:s{seed}:{r}"` (the seed is part of the
+    nonce so slot 0 — the same prompt in every seed — gets an independent physical rerun per seed).
   * `ages` → cell (k, r) is physical if some pair (i, j=r) with `inc_slot[i] == k` (reference_mode
     incumbent) or `i == k` (chain) has `j − i ∈ physical_ages`. (Plan both reference modes' needs.)
-  * `none` → no nonces.
+  * `none` → no nonces. Physical cells in `ages` mode use the same nonce format as `all`.
   * Creation cells (r = k) are never given a nonce and are `physical=1`.
 * **t02 full**: request seed = `sample_seed(s, "eval", "t02", k, "round", r, "test", n)` → every round is an
   independent draw (`physical=1`).
@@ -110,23 +112,50 @@ which cells are physically distinct generations:
 * GT draws: for sampling decodings only, cells `(s,'test','t02',k,('gt',g))` for g < gt_draws with
   seed `sample_seed(s, "gt", "t02", k, "gt", g, "test", n)`.
 * Audit (`audit.enabled`): for `audit.seed`, slots {0, last trajectory incumbent}, each decoding,
-  `repeats` repeats: draws `('audit', a)` with greedy nonce `f"audit:{a}"` and, for t02, the SAME seed as the
-  creation cell (tests seed-reproducibility). Requests are shuffled and chunked differently from the main
-  matrix. Results → `audit_results` (pct_text_identical, pct_correct_flip vs the creation cell).
+  `repeats` repeats: draws `('audit', a)` with nonce `f"audit:s{seed}:{a}"` for BOTH decodings; t02 audit
+  requests reuse the creation cell's sampling seed, so (with the nonce forcing a fresh generation) they test
+  per-request seed reproducibility — without the nonce they would be cache hits, identical by construction.
+  Requests are shuffled and chunked differently from the main matrix. Results → `audit_results` (pct_text_identical, pct_correct_flip vs the creation cell).
 * Execution order: group by draw (each round's requests together); chunk size from config per backend.
-* Scoring: `score_all` runs every registered extractor on every generation that lacks a score row and
-  writes `scores` (INSERT OR IGNORE). No model calls.
+* Scoring: `score_all` runs every registered extractor on every generation that lacks a score row for the
+  extractor's CURRENT source hash and writes `scores` (insert; an existing row is replaced only when its
+  `ext_hash` differs). No model calls. Store inserts are "insert-or-ignore on key conflicts only"
+  (`ON CONFLICT DO NOTHING`), so CHECK/NOT NULL violations still raise.
 * Ledger purposes: `eval_matrix`, `gt_draw`, `audit`.
+
+## 4b. Pipeline (`pipeline.py`) — the orchestration contract used by the CLI, Colab and tests
+```python
+STAGES = ("data", "trajectory", "matrix", "score", "audit", "analyze")
+class Pipeline:
+    def __init__(self, cfg: ExperimentConfig, run_dir: str | Path, backend: Backend | None = None, *,
+                 run_id: str | None = None,             # default cfg.run.name
+                 shard_dir: str | Path | None = None,  # default <run_dir>/shards (Colab: a Drive folder)
+                 allow_engine_change: bool = False, allow_config_change: bool = False,
+                 checkpoint_hook: Callable[[str], None] | None = None,  # called after each committed stage/round
+                 log: Callable[[str], None] = print): ...
+    def open(self) -> None            # store, backend (make_backend(cfg, answer_key) if None), provenance, ensure_run
+    def run(self, stages: Sequence[str] | None = None, max_minutes: float | None = None) -> dict
+    def status(self) -> dict          # per stage: planned / done / complete flag (derived from the data, not flags)
+    def close(self) -> None
+```
+* Run dir layout: `config.yaml` (resolved config), `plan.yaml` (copy of the analysis plan), `store.sqlite`,
+  `shards/`, `exports/analysis/` (bundle), `exports/tables/` (T1–T10 md/csv/tex), `provenance.json`.
+* Every stage is idempotent and resumable: it computes planned − done from the store and does only the rest.
+  `max_minutes` is a soft deadline checked between chunks/rounds; on expiry `run()` returns
+  `{"status": "budget_exhausted", ...}` after committing all finished work (re-running continues).
+* Re-opening a run dir with a different config hash raises unless `allow_config_change`.
+* The analyze stage calls `driftlab.analysis.bundle.analyze(run_dir)` and then
+  `driftlab.reporting.tables.write_tables(bundle, run_dir / "exports" / "tables")`.
 
 ## 5. Generation engine (`engine.py`)
 ```python
 class GenerationEngine:
     def __init__(self, backend, store, run_id, *, chunk_size=512, shard_writer=None,
-                 deadline: float | None = None, fail_after_chunks: int | None = None): ...
+                 deadline: float | None = None, fail_after_chunks: int | None = None, ...): ...
     def run(self, tasks: list[CellTask], *, stage: str, purpose: str, seed: int | None = None,
-            round_: int | None = None) -> dict[CellKey, GenRecord]
+            round_: int | None = None) -> list[GenRecord]          # aligned with tasks
 ```
-* `CellTask = (cell: CellKey | None, request: GenRequest)`. `CellKey` = (run_id, seed, split, decoding_id,
+* `CellTask(cell: CellKey | None, request: GenRequest, physical: bool = False)`. `CellKey` = (run_id, seed, split, decoding_id,
   slot, draw_kind, draw, item_idx). `cell=None` for proposer calls (still stored in `generations`).
 * Steps: compute `rendered = backend.render(system, user)`; `gen_key(...)` with the backend's engine
   fingerprint; dedupe; look up existing generations; generate the missing ones in deterministic chunk order;
@@ -136,6 +165,17 @@ class GenerationEngine:
 * Between chunks: raise `BudgetExhausted` if `deadline` has passed; `DRIFTLAB_FAIL_AFTER_CHUNKS` (env var)
   or `fail_after_chunks` raises `InjectedFailure` (resume tests).
 * Physical vs logical counts are both kept: logical = requested, executed = cache misses.
+* Cells are first-write-wins: re-planning an existing cell with a different gen_key (nonce, seed, prompt,
+  decoding or engine changed) raises `CellConflict` — a changed matrix plan needs a new run dir.
+* Sampling requests MUST carry an explicit seed from `driftlab.keys` (an unseeded sample would be cached and
+  reused by every draw); the engine enforces this.
+* Backend results with `finish_reason="error"` are paid-for calls: they get an extra ledger row with stage
+  `"<stage>:error"` (include in executed cost; exclude when reconciling ledger counts with stored generations).
+* Call `run()` once per seed (pass `seed=`) so the ledger can be split per seed.
+* The engine refuses to write into a run whose stored `engine_fp` differs (`EngineMismatch`), and a synthetic
+  backend makes the run's `synthetic` flag sticky.
+* Restore order (Colab): `replay_shards(store, dir)` BEFORE `ShardWriter.for_store(...)` (else `ShardLogAhead`);
+  a missing shard raises `ShardGap` unless `allow_gaps=True`.
 
 ## 6. Analyses (all post-hoc over the cube; no model calls)
 ### 6.1 Notation
@@ -156,7 +196,13 @@ For every seed s, env c ∈ {E1..E4}, candidate j ∈ 1..R, creation round i ∈
 * Decisions `dec_R = decide(w_R, l_R, N, rule)`; `flip = dec_stored ≠ dec_rerun`.
 * GT (under c): `gt_cand = GT(j)`, `gt_cur = GT(inc_slot[j])`, `gt_ref = GT(ref)` at round j.
   `fa_cur_R = dec_R ∧ gt_cand ≤ gt_cur` (primary), `fa_ref_R = dec_R ∧ gt_cand ≤ gt_ref`.
+* `inflation := infl_extract + infl_generation` (equal to `(w_stored − w_rerun)/N` up to 1 ulp; makes the
+  decomposition exact; a zero stays exactly 0.0).
 * `by_construction = (same_gen_frac(stored_cell, rerun_cell) == 1) ∧ (x_st == x_c)` → "‡ identical by construction".
+  `gen_by_construction`: the generation part is 0 because rerun and stored are the same generation (‡ on that
+  part). `gt_coupled`: under greedy (or `same_draw`) GT reuses the decision cells, so FAR against a reference that
+  IS the GT cell is 0 by construction (‡). Byte-identical text from a physical rerun is a *measured* reproduction
+  (`Cube.same_text_frac`), not a by-construction zero.
 * `split_half` GT mode: decisions use items [0, N/2), GT uses items [N/2, N).
 * Keep per-item arrays `(cand∧¬stored) − (cand∧¬rerun)` for the paired bootstrap.
 * `summarize_pairs(df, by=("env","age"))`: pooled means, FAR = Σfa/Σdec with Wilson 95% CI, flip rate,
@@ -169,7 +215,13 @@ teammate footnote), `P1b` frozen + adopt-on-promote, `P2` per-batch refresh, `P3
 `P4_k<k>` age-triggered (age ≥ k), `P5` component-aware (regenerate if decoding/model/engine changed;
 re-score stored text at zero cost if only the extractor changed), `ORACLE` (decides on GT; cost N per round),
 `FIXEDAGE_k<k>` (ablation A4: reference = incumbent output stored k rounds earlier under that round's env).
-All except P1/ORACLE adopt the candidate's already-computed outputs as the new reference on promotion (0 calls).
+All except P1, ORACLE and FIXEDAGE adopt the candidate's already-computed outputs as the new reference on
+promotion (0 calls). FIXEDAGE: `inc_hist[r]` = shadow incumbent when candidate r is evaluated (`inc_hist[0]=0`);
+the reference at round t is `inc_hist[max(t−k,0)]`'s output at that round under that round's env (FIXEDAGE_k0 ≡ P2);
+it is charged N only when the reference snapshot actually changes. `RoundDecision.gt_coupled` marks rounds whose
+reference is the shadow incumbent's own GT cell (decision ≡ GT comparison); `policy_summary` reports
+`n_gt_coupled` / `n_accepted_gt_coupled`, and a FAR whose accepts are all coupled is rendered with ‡.
+`split_half` requires disjoint `items` (decision) and `gt_items` (GT).
 ```
 round 0: inc = 0; ref = Ref(slot 0, round 0, env=sched[0], scores=V(s,d0,0,('round',0),x0), source='initial')
 for t in 1..R:
@@ -224,12 +276,20 @@ snapshots), `candidates` (T5 rows), `ablations`, `schedule_random`, `hypotheses`
   [CI], FAR_cur(stored), FAR_cur(rerun), FAR_cur(fresh), flip rate, n_pairs, n_accepts (+ T7b full grid);
   T8 A1–A4; T9 per seed + mean±sd row; T10 dashboard components (page, what it shows, data source, status).
 * `driftlab tables` refuses to write a synthetic run into `results/` (only into the run's exports).
+* ‡ marks values that are identical/zero BY CONSTRUCTION (by_construction, gen_by_construction, gt_coupled);
+  every table that can contain one carries the explanatory footnote.
 * The teammate's reported numbers (`results/reported/teammate.yaml`) are shown side-by-side, never merged.
 
 ## 8. CLI (`driftlab`)
 `estimate | run | status | analyze | tables | demo | extract | audit | freeze-plan | verify-extractors |
 dashboard | info`. `run -c CONFIG --run-dir DIR [--stages ...] [--max-minutes M] [--set k=v]` is idempotent.
 `demo` = run `configs/demo_mock.yaml` + analyze + tables into `runs/demo_mock`.
+
+## 8b. Backend notes
+* openai_compat: `base_url` is NOT part of the engine fingerprint (Colab tunnel URLs change); the user-declared
+  `backend.openai_compat.server_tag` describes the server engine instead. Main runs against `vllm serve` must use
+  `--generation-config vllm --no-enable-prefix-caching` (prefix caching would bias physical-rerun drift to zero).
+* HF CPU tests use `trl-internal-testing/tiny-Qwen2ForCausalLM-2.5@ce8d0bf270b28c8fab026ced69fe8aa14b0f0eda`.
 
 ## 9. Dashboard (`app/`)
 Streamlit multi-page app; sidebar run picker over `runs/*/` (and `DRIFTLAB_RUN`); read-only DB; red

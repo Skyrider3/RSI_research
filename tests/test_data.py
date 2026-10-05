@@ -18,12 +18,12 @@ from driftlab.data import (
     Item,
     LeakageError,
     answer_key,
+    canonical_gold,
     canonical_number,
     load_dev,
     load_eval,
     load_items,
     load_split,
-    parse_gold,
     snapshot_info,
 )
 
@@ -219,17 +219,17 @@ def test_canonical_number_rejects(raw: str) -> None:
 
 
 def test_parse_gold() -> None:
-    assert parse_gold("Some work\n#### 1,000") == "1000"
-    assert parse_gold("a #### 2 then #### 3") == "3"
+    assert canonical_gold("Some work\n#### 1,000") == "1000"
+    assert canonical_gold("a #### 2 then #### 3") == "3"
     with pytest.raises(ValueError):
-        parse_gold("no marker 5")
+        canonical_gold("no marker 5")
 
 
 def test_all_400_golds_parse_and_match_extraction() -> None:
     cfg = ExperimentConfig()
     items = load_items(cfg, "dev") + load_items(cfg, "eval")
     assert len(items) == 400
-    assert all(it.gold == parse_gold(it.answer_text) for it in items)
+    assert all(it.gold == canonical_gold(it.answer_text) for it in items)
     assert all(it.gold.lstrip("-").isdigit() for it in items)  # GSM8K golds are integers
     try:
         from driftlab.extraction import canonical

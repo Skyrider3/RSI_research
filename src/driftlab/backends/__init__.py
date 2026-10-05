@@ -94,4 +94,12 @@ def make_backend(cfg: ExperimentConfig, answer_key: Mapping[str, str] | None = N
         return VLLMBackend(model_id, revision, cfg.backend.vllm, dtype=cfg.model.dtype)
     from driftlab.backends.openai_compat import OpenAICompatBackend
 
-    return OpenAICompatBackend(model_id, revision, cfg.backend.openai_compat)
+    oc = cfg.backend.openai_compat
+    return OpenAICompatBackend(
+        model_id,
+        revision,
+        oc,
+        render_mode=oc.render_mode,
+        vllm_extras=oc.vllm_extras,
+        extra_body=oc.extra_body,
+    )

@@ -569,7 +569,8 @@ def test_openai_chat_template_payload(monkeypatch):
     assert s["temperature"] == 0.2 and s["seed"] == 4242
     info = b.engine_info()
     assert info["kind"] == "openai_compat" and info["render"] == "chat_template"
-    assert info["base_url"] == "http://server.test/v1" and info["served_model"] == "qwen-served"
+    assert "base_url" not in info and info["served_model"] == "qwen-served"
+    assert info["server_tag"] == ""
     assert info["payload"] == openai_compat.PAYLOAD_VERSION  # body semantics are fingerprinted
 
 
