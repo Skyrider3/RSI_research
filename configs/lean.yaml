@@ -1,0 +1,6 @@
+# Cheaper variant for a free Colab T4: one shared sampled draw per prompt, no physical greedy reruns.
+# Caveat: repeated regenerations under an unchanged sampling environment return the same sample.
+extends: full.yaml
+run: {name: lean}
+matrix: {mode: lean, physical_greedy_reruns: none}
+audit: {repeats: 1, n_items: 100}

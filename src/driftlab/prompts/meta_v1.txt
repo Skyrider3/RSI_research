@@ -1,0 +1,14 @@
+You are improving the system prompt of an assistant that solves grade-school math word problems. The assistant's final answer is graded automatically, so the prompt must keep telling the assistant to finish with the final numeric answer inside \boxed{}.
+
+The current system prompt is:
+<current_prompt>
+{current_prompt}
+</current_prompt>
+
+Below are {n_errors} problems from a development set that the assistant answered incorrectly when using the current system prompt.
+
+{error_blocks}
+
+Analyse what went wrong and write an improved system prompt that would help the assistant avoid these kinds of mistakes on new, unseen problems. Do not copy the specific problems or their answers into the prompt. Keep the prompt under 200 words.
+
+Return ONLY the new system prompt, enclosed between <prompt> and </prompt> tags.

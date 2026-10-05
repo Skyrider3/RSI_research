@@ -1,0 +1,56 @@
+# Pre-registered analysis plan (v1). Freeze with `driftlab freeze-plan` BEFORE the main run; the sha256 of this
+# file is recorded in provenance and printed in every table footnote. Items marked TO DISCUSS are defaults
+# chosen so the pipeline runs end-to-end; see docs/DECISIONS.md.
+version: prereg_v1
+
+# Which prompt a reference belongs to in the all-pairs analysis.
+#   incumbent: the reference created at round i is the trajectory incumbent's output at round i (default)
+#   chain:     the reference is slot i itself                                            (TO DISCUSS)
+reference_mode: incumbent
+
+# Stored references in T4/T7 were generated under this environment and keep the scores they had then.
+storage_env: E1
+
+# Promotion rule used by every reference-based policy (dry-run; nothing is ever auto-promoted).
+promotion_rule:            # TO DISCUSS (margin / rule used by the teammate's Table 3)
+  kind: net_win            # accept iff (wins - losses) / n > margin
+  margin: 0.0
+  tau: 0.05                # used by kind: win_rate
+  alpha: 0.10              # used by kind: mcnemar
+
+# Ground truth: under sampling, GT accuracy is measured on an independent draw so that the promotion decision
+# and the ground truth are not computed from the same sample (winner's-curse coupling).
+gt:
+  mode: independent_draw   # independent_draw | same_draw | split_half
+  canonical_env: E1        # env used for the "final accuracy" column of T3 (TO DISCUSS: E1 vs E3)
+
+# Environment schedule for the policy simulation (round -> env id). Two changes in 11 rounds.
+schedule: {0: E1, 4: E2, 8: E4}   # TO DISCUSS
+
+policies: [P1, P1b, P2, P3, P4_k3, P5, ORACLE]
+headline_policies: [P1, P2, P3]
+cost_convention: teammate_v1     # teammate_v1 reproduces 4411 / 6611 / 4811; 'full' also counts candidate dev runs
+
+t4: {age: 3}
+t7: {ages: [0, 1, 3, 5, 10], unchanged_env: E1, changed_env: E4}
+
+ablations:
+  A1: {schedule: {0: E1, 4: E2, 8: E4}, description: "Full system (decoding + extraction changes, variable age)"}
+  A2: {schedule: {0: E1, 8: E3}, description: "No decoding changes (extraction change only)"}
+  A3: {schedule: {0: E1, 4: E2}, description: "No extraction changes (decoding change only)"}
+  A4: {schedule: {0: E1, 4: E2, 8: E4}, fixed_age: 1, description: "Fixed reference age (always 1 round old)"}
+
+primary_contrasts:
+  H1: "drift inflation at reference age 3 under E2, E3, E4 versus the unchanged-environment control E1 (paired item bootstrap CI)"
+  H2: "FAR(P1) - FAR(P2) and FAR(P1b) - FAR(P2) (pooled over seeds, bootstrap CI)"
+  H3: "reference calls P3 / P2, and FAR(P3) - FAR(P2) compared with the equivalence margin"
+h3_equivalence_margin_pp: 10.0   # TO DISCUSS
+
+bootstrap: {B: 2000, seed: 20261004}
+schedule_randomization: {n: 200, n_changes: 2, seed: 7}   # exploratory
+
+notes: >
+  Expected (pre-registered) pattern: extraction changes can only raise measured accuracy (v1-correct implies
+  v2-correct), so inflation under E3 is >= 0 when reruns are deterministic; the sign under decoding changes is
+  unknown. Within an environment status, inflation should be roughly flat across reference ages while FAR against
+  the current incumbent should rise with age (prompt staleness). We will report these whether or not they hold.

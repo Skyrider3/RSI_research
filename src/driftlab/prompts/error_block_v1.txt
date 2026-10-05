@@ -1,0 +1,8 @@
+### Problem {i}
+{question}
+
+### Assistant's response (truncated)
+{response}
+
+### Correct final answer
+{gold}

@@ -1,0 +1,14 @@
+# Numbers reported by a teammate (Nischae) in the proposal doc, transcribed verbatim.
+# Displayed ONLY as a separate "reported" column; never merged with values reproduced by this tool.
+source: "Proposal doc, Tables 3 and 4 (Nischae). Mean ± sd over 3 seeds, 200 test questions, 11 rounds."
+T3:
+  - {policy: P1, name: "Frozen reference", refresh_rule: "Never refresh", gt_acc: "71.0 ± 2.0", far: "42.9 ± 14.3", model_calls: 4411, refreshes: 0}
+  - {policy: P2, name: "Per-batch refresh", refresh_rule: "Refresh every batch", gt_acc: "69.7 ± 3.1", far: "8.3 ± 14.4", model_calls: 6611, refreshes: 11}
+  - {policy: P3, name: "Environment-triggered refresh", refresh_rule: "Refresh after detected environment changes", gt_acc: "71.7 ± 2.3", far: "11.1 ± 19.2", model_calls: 4811, refreshes: 2}
+T3_footnote: "False-accept rate is worked out per seed and then averaged. The frozen reference is the stored output of the round-0 prompt, so it also accepts candidates that beat the starting prompt but not the current one."
+T4:
+  - {env: "Unchanged", age: 3, stored_win: "9.06 ± 1.04", rerun_win: "9.06 ± 1.04", inflation: "0.00 ± 0.00"}
+  - {env: "Decoding change", age: 3, stored_win: "9.58 ± 0.94", rerun_win: "9.62 ± 2.84", inflation: "-0.04 ± 2.03"}
+  - {env: "Extraction change", age: 3, stored_win: "10.25 ± 1.38", rerun_win: "8.94 ± 1.47", inflation: "1.31 ± 0.72"}
+  - {env: "Multiple changes", age: 3, stored_win: "10.81 ± 1.47", rerun_win: "8.54 ± 2.22", inflation: "2.27 ± 0.81"}
+T4_footnote: "Each cell averages every candidate and reference pair that are 3 rounds apart. The reference answers were stored under E1 and kept the scores they had at the time."

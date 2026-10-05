@@ -1,0 +1,12 @@
+# Deterministic fallback edits appended to the incumbent prompt when every proposer attempt is invalid.
+# One sentence is chosen with a seeded RNG among those not already present. Fallback candidates are flagged
+# (origin = fallback) and reported separately.
+edits:
+  - "Read the question carefully and identify exactly what quantity is being asked for."
+  - "Write down each intermediate quantity with its units before combining them."
+  - "Double-check every arithmetic step before writing the final answer."
+  - "If the problem involves money, give the final answer as a plain number without the currency symbol."
+  - "Make sure the final answer answers the question that was asked, not an intermediate value."
+  - "Keep track of totals versus per-item amounts and convert units when needed."
+  - "After solving, verify the answer by substituting it back into the problem."
+  - "Give the final answer as a plain number with no commas, units, or extra words inside the box."
