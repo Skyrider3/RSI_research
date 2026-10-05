@@ -214,3 +214,43 @@ def test_synthetic_run_under_results_dir_keeps_the_bundle(run, tmp_path):
     assert any("tables not written" in m for m in logs)
     assert (dst / "exports" / "analysis" / "bundle.json").is_file()
     assert not (dst / "exports" / "tables").exists()
+
+
+def test_plan_lock_and_ci_wording_reach_the_tables(run):
+    from driftlab.analysis.bundle import PLAN_LOCK_STATUSES
+
+    lock = run.bundle.meta["plan_lock"]
+    assert lock["status"] in PLAN_LOCK_STATUSES and lock["lock_path"].endswith("prereg_v1.lock.json")
+    assert lock["run_created_at"] and len(lock["plan_sha256"]) == 64
+    assert run.bundle.meta["stale_scores"] == []
+    t1 = _read_csv(run.tables / "T1.csv")
+    assert t1["Component"].tolist()[-1] == "Pre-registration"
+    md = (run.tables / "T4.md").read_text(encoding="utf-8")
+    assert ("— plan not frozen" in md) == (lock["status"] != "locked_before_run")
+    t7 = (run.tables / "T7.md").read_text(encoding="utf-8")
+    assert "resampled with one shared index vector; seeds and generations held fixed" in t7
+    assert "stratified" not in (run.tables / ALL_TABLES).read_text(encoding="utf-8")
+
+
+def test_default_run_rescores_stale_scores_before_analyze(run, tmp_path):
+    """A changed extractor source makes stored scores stale: analyze alone refuses them, a default run()
+    re-scores first (score_all replaces exactly the stale rows, no model calls) and then analyzes cleanly."""
+    from driftlab.analysis.bundle import StaleScoresError
+
+    dst = tmp_path / "stale"
+    shutil.copytree(run.run_dir, dst)
+    with sqlite3.connect(dst / "store.sqlite") as con:
+        n = con.execute("UPDATE scores SET ext_hash = '000000000000' WHERE extractor = 'v2'").rowcount
+    assert n > 0
+    with (
+        Pipeline(run.cfg, dst, log=lambda _m: None) as p,
+        pytest.raises(StaleScoresError, match="--stages score"),
+    ):
+        p.run(["analyze"])
+    with Pipeline(run.cfg, dst, log=lambda _m: None) as p:
+        res = p.run()
+    assert res["status"] == "ok" and res["executed"] == 0
+    assert res["stages"]["score"]["written"]["v2"] == n and res["stages"]["score"]["written"]["v1"] == 0
+    bundle = load_bundle(dst)
+    assert bundle.meta["stale_scores"] == [] and not bundle.meta["warnings"]
+    assert "STALE" not in (dst / "exports" / "tables" / ALL_TABLES).read_text(encoding="utf-8")

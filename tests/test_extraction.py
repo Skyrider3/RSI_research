@@ -48,11 +48,19 @@ FROZEN_JSON = Path(__file__).with_name("extractors_frozen.json")
 MINUS = "\u2212"
 
 # The project lead's literal patterns; the shipped ones are backtracking-safe rewrites of the same languages.
-SPEC_HASH_ANSWER_RE = re.compile(r"[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*[\d.]")
+SPEC_HASH_ANSWER_RE = re.compile(r"[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*(?:\d|\.\d)")
+SPEC_NUMBERED_HEADING_RE = re.compile(r"\d+[.)]\s+[A-Za-z]")
 SPEC_BOLD_NUMERIC_RE = re.compile(
     r"^\s*(?:[A-Za-z]\s*=\s*)?[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*(?:\d[\d,]*(?:\.\d+)?|\.\d+)\s*"
     r"(?:\\?%|[A-Za-z]+(?:\s+[A-Za-z]+)?)?\s*[.!]?\s*$"
 )
+
+
+def _spec_is_hash_answer(content: str) -> bool:
+    """The lead's rule, literally: stripped content starts like a number and is not a numbered heading."""
+    c = content.strip()
+    return SPEC_HASH_ANSWER_RE.match(c) is not None and SPEC_NUMBERED_HEADING_RE.match(c) is None
+
 
 # --------------------------------------------------------------------------- golden cases
 # (text, v1 value, v2 value, v1 method, v2 method); values are Fraction() strings or None.
@@ -156,6 +164,28 @@ GOLDEN: list[tuple[str, str | None, str | None, str, str]] = [
     ("#### -$5", None, "-5", "none", "hash"),
     ("#### $-5", None, "-5", "none", "hash"),
     ("#### $ 1,000.", None, "1000", "none", "hash"),
+    ("#### 4.", "4", "4", "hash", "hash"),  # a number with a final '.' is not a numbered heading
+    ("#### -.5", None, "-1/2", "none", "hash"),
+    ("#### $.5", None, "1/2", "none", "hash"),
+    # --- a sign separated from the number by whitespace is kept (parse_lenient) -----------------
+    ("#### - 7", None, "-7", "none", "hash"),
+    (f"#### {MINUS}  7", None, "-7", "none", "hash"),
+    ("#### $ - 7", None, "-7", "none", "hash"),
+    ("#### - $7", None, "-7", "none", "hash"),
+    ("#### - 1,234.", None, "-1234", "none", "hash"),
+    ("**- 7**", None, "-7", "none", "bold"),
+    ("So **x = - 7**", None, "-7", "none", "bold"),
+    (r"\boxed{- 7}", None, "-7", "none", "boxed"),
+    (f"\\boxed{{{MINUS}  7}}", None, "-7", "none", "boxed"),
+    (r"\boxed{\$ - 7}", None, "-7", "none", "boxed"),
+    (r"\boxed{- .5}", None, "-1/2", "none", "boxed"),
+    (r"\boxed{- 7/2}", None, "-7/2", "none", "boxed"),
+    (r"\boxed{x = - 7}", None, "-7", "none", "boxed"),
+    (r"\boxed{\text{- 7 apples}}", None, "-7", "none", "boxed"),
+    (r"\boxed{12 - 7 = 5}", None, "5", "none", "boxed"),  # only a sign at the START is joined
+    (r"\boxed{3 - 4}", None, "3", "none", "boxed"),
+    ("The answer is - 7", None, "-7", "none", "answer_phrase"),
+    (r"\fbox{- 7}", None, "-7", "none", "fbox"),
     # --- only QUALIFYING "####" lines are markers (rest of the line starts like a number) ------
     ("\\boxed{72}\n\n#### Step 4: Verify", "72", "72", "boxed", "boxed"),
     ("\\boxed{72}\n\n#### Step 4: Verify\nWe check it.", "72", "72", "boxed", "boxed"),
@@ -180,11 +210,31 @@ GOLDEN: list[tuple[str, str | None, str | None, str, str]] = [
     ("#### Verification", None, None, "none", "none"),
     ("####", None, None, "none", "none"),
     ("### Step 1\n#### Step 2\n\\boxed{6}", "6", "6", "boxed", "boxed"),
+    # numberless lines: a '.' only qualifies when a digit follows it ("#### .5" does)
+    ("\\boxed{18}\n#### ...", "18", "18", "boxed", "boxed"),
+    ("\\boxed{18}\n#### .", "18", "18", "boxed", "boxed"),
+    ("\\boxed{18}\n#### -.", "18", "18", "boxed", "boxed"),
+    ("\\boxed{18}\n#### $.", "18", "18", "boxed", "boxed"),
+    ("\\boxed{18}\n#### .5", None, "1/2", "none", "hash"),
+    ("#### ...", None, None, "none", "none"),
+    ("#### ...\nSo we get 42", None, "42", "none", "last_number"),
+    ("#### 42\n#### ...", "42", "42", "hash", "hash"),
+    # numbered headings ("4. Verification", "2) Check") are not markers
+    ("\\boxed{72}\n\n#### 4. Verification\nWe check 72 / 2 = 36.", "72", "72", "boxed", "boxed"),
+    ("\\boxed{72}\n\n#### 2) Check the answer", "72", "72", "boxed", "boxed"),
+    ("#### 1. Understand the problem\nWe need 5 + 7 = 12", None, "12", "none", "last_number"),
+    ("#### 42\n\n#### 4. Verification\nWe check 42 / 2 = 21.", "42", "42", "hash", "hash"),
+    ("#### 42.\n#### 5) Done", "42", "42", "hash", "hash"),
+    ("#### 10. Final answer: 42", None, "42", "none", "answer_phrase"),
+    ("#### 3. Check\n**18**", None, "18", "none", "bold"),
+    ("#### 2.\tVerify", None, "2", "none", "last_number"),  # any whitespace after the '.'
+    ("#### 9 #### 4) a", None, "9", "none", "hash"),  # last "####" is a heading; the earlier one is not
+    ("#### 3.5 hours", None, "3.5", "none", "hash"),  # a decimal, not a heading
     # --- marker selection and v2 fallback to the OTHER marker -------------------------------
     ("\\boxed{1,234}\n#### 1234", "1234", "1234", "hash", "hash"),
     ("#### 1,234\n\\boxed{1234}", "1234", "1234", "boxed", "boxed"),
     ("\\boxed{18}\n#### eighteen", "18", "18", "boxed", "boxed"),  # "eighteen" does not qualify
-    ("\\boxed{18}\n#### -.", None, "18", "none", "boxed"),  # qualifies but holds no number: v2 -> box
+    ("\\boxed{18}\n#### 7 = x", None, "18", "none", "boxed"),  # qualifies; parse reads "x": v2 -> box
     ("#### 18\n\\boxed{x}", None, "18", "none", "hash"),
     ("\\boxed{x}\nThe answer is 12", None, "12", "none", "answer_phrase"),
     ("\\boxed{\\text{eighteen}}", None, None, "none", "none"),
@@ -240,18 +290,12 @@ GOLDEN: list[tuple[str, str | None, str | None, str, str]] = [
     ("We have 120,150,180 in total", None, "120150180", "none", "last_number"),
     # The LAST box is selected even when it is empty.
     ("\\boxed{18}\nThe final answer is \\boxed{}", None, "18", "none", "last_number"),
-    # HASH_ANSWER_RE admits a leading '.', so an ellipsis line after the box is the selected marker.
-    ("\\boxed{18}\n#### ...", None, "18", "none", "boxed"),
-    ("\\boxed{18}\n#### .", None, "18", "none", "boxed"),
-    # A NUMBERED heading starts like a number, so it qualifies (spec rule) and shadows an earlier box:
-    # v1 rejects it and v2 reads the heading's number (lead decision; see the review report).
-    ("\\boxed{72}\n\n#### 4. Verification\nWe check 72 / 2 = 36.", None, "4", "none", "hash"),
-    ("\\boxed{72}\n\n#### 2) Check the answer", None, "2", "none", "hash"),
-    ("#### 1. Understand the problem\nWe need 5 + 7 = 12", None, "1", "none", "hash"),
-    # parse_lenient drops a sign that is separated from the digits by a space (also in bold, which
-    # BOLD_NUMERIC_RE accepts as number-like); no GSM8K gold among the 400 items is negative.
-    ("#### - 7", None, "7", "none", "hash"),
-    ("**- 7**", None, "7", "none", "bold"),
+    # The numbered-heading rule needs whitespace after the '.' / ')' (lead's pattern), so a run-together
+    # heading qualifies and shadows an earlier box; a heading whose text starts with a digit qualifies too.
+    ("\\boxed{72}\n#### 4.Verification", None, "4", "none", "hash"),
+    ("\\boxed{72}\n#### 4. 5 apples", None, "4", "none", "hash"),
+    # The spaced sign is joined only when a NUMBER follows it, not a \frac (the frac's numerator is read).
+    (r"\boxed{- \frac{1}{2}}", None, "1", "none", "boxed"),
     # The bold stage takes the LAST NUMBER-LIKE span: a later non-number-like span is skipped, not a stop.
     ("We buy **5** apples. Total: **Total: 18**", None, "5", "none", "bold"),
     # A fraction is not number-like bold content; the last-number stage reads the denominator.
@@ -317,6 +361,9 @@ def test_v1_reports_rejected_marker_content() -> None:
     assert ex == Extraction(None, "none", (10, 15), "1,234")
     assert extract_v1("#### $42") == Extraction(None, "none", (5, 8), "$42")
     assert extract_v1("#### Step 4: Verify") == NO_EXTRACTION  # not a marker at all
+    assert extract_v1("#### 4. Verification") == NO_EXTRACTION
+    assert extract_v1("#### ...") == NO_EXTRACTION
+    assert extract_v1("#### - 7") == Extraction(None, "none", (5, 8), "- 7")
     assert extract_v1("nothing to see") == NO_EXTRACTION
     assert NO_EXTRACTION.extracted is None
 
@@ -394,9 +441,15 @@ def test_last_hash_line() -> None:
     assert last_hash_line("#### \n") is None
     assert last_hash_line("#### 7\n#### Step 4: Verify\n####\n#### Final Answer\n") == ("7", 5, 6)
     assert last_hash_line("#### .5") == (".5", 5, 7)
+    assert last_hash_line("#### ...") is None and last_hash_line("#### .\n#### -.") is None
+    assert last_hash_line("#### 4. Verification") is None and last_hash_line("#### 2) Check") is None
+    assert last_hash_line("#### 4.") == ("4.", 5, 7)
+    assert last_hash_line("#### 42\n#### 4. Verification\n#### ...") == ("42", 5, 7)
     assert last_hash_line("##### 42") == ("42", 6, 8)  # overlapping occurrence: last one reads " 42"
     assert last_hash_line("#### 1 #### Step 2") == ("1 #### Step 2", 5, 18)  # rest of the line
+    assert last_hash_line("#### 1 #### 2. Check") == ("1 #### 2. Check", 5, 20)
     assert last_hash_line("#### $\n5") is None  # the qualification test never crosses the newline
+    assert last_hash_line("#### .\n5") is None and last_hash_line("#### 4.\nA") == ("4.", 5, 7)
 
 
 @pytest.mark.parametrize(
@@ -415,9 +468,29 @@ def test_last_hash_line() -> None:
         ("42 apples", True),
         ("1,234.", True),
         ("\uff14\uff12", True),
-        ("...", True),  # documented: a leading '.' qualifies
-        ("4. Verification", True),  # documented: numbered headings start like a number
-        ("2) Check the answer", True),
+        ("-.5", True),
+        ("$ .5", True),
+        ("4.", True),  # numbers with a final '.' and decimals are not numbered headings
+        ("42.", True),
+        ("3.5", True),
+        ("3.5 hours", True),
+        ("4) ", True),
+        ("4. 5 apples", True),  # documented: the heading text must start with a letter
+        ("4.Verification", True),  # documented: whitespace after the '.' is required
+        ("- 7", True),
+        ("$ - 7", True),
+        ("...", False),  # a '.' qualifies only when a digit follows
+        (".", False),
+        ("-.", False),
+        ("$.", False),
+        ("- .", False),
+        (". 5", False),
+        ("4. Verification", False),  # numbered headings
+        ("2) Check the answer", False),
+        ("10) Final answer: 42", False),
+        ("4.\t Check", False),
+        ("1. a", False),
+        ("\uff14. Verification", False),  # full-width digits are Unicode \d
         ("# 5", False),  # "#####" heading: the earlier, overlapping occurrence reads "# 5"
         ("Step 4: Verify the 3 parts", False),
         ("", False),
@@ -437,7 +510,8 @@ def test_last_hash_line() -> None:
 )
 def test_is_hash_answer(content: str, ok: bool) -> None:
     assert is_hash_answer(content) is ok
-    assert (SPEC_HASH_ANSWER_RE.match(content.strip()) is not None) is ok
+    assert _spec_is_hash_answer(content) is ok
+    assert is_hash_answer(f" \t{content}\u2003 ") is ok  # surrounding blanks never matter
 
 
 @pytest.mark.parametrize(
@@ -490,7 +564,7 @@ def _naive_last_hash(text: str) -> tuple[int, str, tuple[int, int]] | None:
             nl = text.find("\n", start)
             raw = text[start : len(text) if nl < 0 else nl]
             content = raw.strip()
-            if SPEC_HASH_ANSWER_RE.match(content):
+            if _spec_is_hash_answer(content):
                 lead = len(raw) - len(raw.lstrip())
                 found = (pos, content, (start + lead, start + lead + len(content)))
     return found
@@ -514,7 +588,7 @@ def _naive_last_box(text: str) -> tuple[int, str, tuple[int, int]] | None:
 
 
 _HASHY = st.one_of(
-    st.text(alphabet="# \t\n\r\u00a0-+$\\.5a" + MINUS, max_size=40),
+    st.text(alphabet="# \t\n\r\u00a0-+$\\.5a)" + MINUS, max_size=40),
     st.lists(
         st.sampled_from(
             [
@@ -523,7 +597,19 @@ _HASHY = st.one_of(
                 "#####",
                 "#### Step 3",
                 "#### Final Answer",
+                "#### 4. Verification",
+                "#### 2) Check",
+                "#### 10.\tDone",
+                "#### 4.",
+                "#### 3.5",
+                "#### .5",
+                "#### ...",
+                "#### -.",
+                "#### - 7",
                 "### Step 2",
+                "4. A",
+                "7)",
+                " a",
                 "\n",
                 " ",
                 "-",
@@ -568,7 +654,14 @@ _MARKER_MIX = st.lists(
             "#### $42.",
             "#### Step 4: Verify",
             "#### Final Answer",
+            "#### 4. Verification",
+            "#### 2) Check",
+            "#### 4.",
+            "#### .5",
             "#### ...",
+            "#### -.",
+            "#### - 7",
+            "#### 7 = x",
             "####",
             "#",
             "\n",
@@ -672,17 +765,31 @@ def test_hash_answer_re_equals_spec_pattern_exhaustively() -> None:
     assert n == sum(9**k for k in range(6))  # 66430 strings
 
 
+def test_is_hash_answer_equals_spec_rule_exhaustively() -> None:
+    """The full qualification rule (number-like start, not a numbered heading) on every string of length
+    <= 5 over the heading/number token classes: same verdict as the lead's literal rule, and the linear
+    scan's per-line test agrees with it on a "####" line built from the same string."""
+    n = 0
+    for s in _all_strings(f"7.) a-$\u00a0{MINUS}", 5):
+        n += 1
+        ok = _spec_is_hash_answer(s)
+        assert is_hash_answer(s) is ok, repr(s)
+        assert (last_hash_line(f"x\n####{s}\ny") is not None) is ok, repr(s)
+    assert n == sum(9**k for k in range(6))  # 66430 strings
+
+
 def test_bold_numeric_re_equals_spec_pattern_exhaustively() -> None:
     """Every string of length <= 4 over the pattern's token classes: same verdict as the spec."""
     for s in _all_strings(f"x= -{MINUS}+\\$1,.%!", 4):
         assert (BOLD_NUMERIC_RE.match(s) is None) == (SPEC_BOLD_NUMERIC_RE.match(s) is None), repr(s)
 
 
-@given(st.text(alphabet=f"xab= \t-{MINUS}+\\$15,.%!", max_size=16))
+@given(st.text(alphabet=f"xab= \t-{MINUS}+\\$15,.%!)", max_size=16))
 @settings(derandomize=True, database=None, max_examples=3000)
 def test_rewritten_patterns_equal_spec_patterns(s: str) -> None:
     assert (HASH_ANSWER_RE.match(s) is None) == (SPEC_HASH_ANSWER_RE.match(s) is None)
     assert (BOLD_NUMERIC_RE.match(s) is None) == (SPEC_BOLD_NUMERIC_RE.match(s) is None)
+    assert is_hash_answer(s) is _spec_is_hash_answer(s)
 
 
 @pytest.mark.parametrize(
@@ -695,8 +802,28 @@ def test_rewritten_patterns_equal_spec_patterns(s: str) -> None:
         ("####" + " " * 50 + "\n") * 1_000,
         ("**" + " " * 19 + "5" + " " * 18 + "x**") * 1_000,
         "\\boxed{1}" + "\n#### Final Answer" * 5_000,
+        "\\boxed{1}" + "\n#### 4. Verification" * 5_000,
+        "#### 9) a" * 10_000,
+        "####" + "9" * 30_000 + ")" + " " * 30_000 + "7",
+        ("#### " + "." * 50 + "\n") * 1_000,
+        "\\boxed{-" + " \t" * 30_000 + "7}",
+        "\\boxed{-" + " " * 60_000 + "x}",
     ],
-    ids=["hashes", "headings", "blank-run", "mixed-blank-run", "blank-lines", "bold-blanks", "box-headings"],
+    ids=[
+        "hashes",
+        "headings",
+        "blank-run",
+        "mixed-blank-run",
+        "blank-lines",
+        "bold-blanks",
+        "box-headings",
+        "box-numbered-headings",
+        "same-line-numbered-headings",
+        "heading-backtrack",
+        "dot-lines",
+        "spaced-sign",
+        "spaced-sign-no-number",
+    ],
 )
 def test_pathological_inputs_are_fast(text: str) -> None:
     """Linear marker scan and backtracking-safe patterns: no quadratic/cubic blow-up on long runs."""
@@ -721,6 +848,10 @@ def test_select_marker_skips_non_qualifying_hash_lines() -> None:
     assert select_marker("#### 7\n#### Step 2") == ("hash", "7", (5, 6))
     assert select_marker("#### Final Answer") is None
     assert select_marker("####\n#### \n") is None
+    tail = "\n#### 4. Verification\n#### 2) Check\n#### ..."
+    assert select_marker("\\boxed{72}" + tail) == ("boxed", "72", (7, 9))
+    assert select_marker("#### 4.\n#### 5. Done") == ("hash", "4.", (5, 7))
+    assert other_marker("#### 5\n\\boxed{6}\n#### 3) Check", "boxed") == ("hash", "5", (5, 6))
 
 
 @pytest.mark.parametrize(
@@ -744,10 +875,57 @@ def test_select_marker_skips_non_qualifying_hash_lines() -> None:
         ("\\text{\\text{\\text{12}}}", "12"),
         ("twelve", None),
         ("", None),
+        # a leading sign separated from the first number by whitespace is kept
+        ("- 7", "-7"),
+        (f"{MINUS}  7", "-7"),
+        ("-\t\n7", "-7"),
+        ("-\u00a07", "-7"),
+        ("$ - 7", "-7"),
+        ("\\$ - 7", "-7"),
+        ("- $ 7", "-7"),
+        ("{- 7}", "-7"),
+        ("\\text{- 7}", "-7"),
+        ("x = - 7", "-7"),
+        ("- .5", "-1/2"),
+        ("- 1,234.5", "-2469/2"),
+        ("- 7/2", "-7/2"),
+        ("- 7 - 3", "-7"),
+        ("- \uff17", "-7"),
+        ("12 - 7 = 5", "5"),  # not at the start: the last '=' decides
+        ("3 - 4", "3"),
+        ("- 12 - 7 = 5", "5"),
+        ("- - 7", "7"),  # the sign must directly precede the number
+        ("- x 7", "7"),
+        ("- \\frac{1}{2}", "1"),  # documented: a \frac is not a number, so the sign is not joined
+        ("-", None),
+        ("- ", None),
     ],
 )
 def test_parse_lenient(s: str, expected: str | None) -> None:
     assert parse_lenient(s) == _frac(expected)
+
+
+@given(
+    st.from_regex(r"[0-9]{1,12}(?:\.[0-9]{1,6})?", fullmatch=True),
+    st.sampled_from(["-", MINUS]),
+    st.text(alphabet=" \t\n\u00a0\u2003", min_size=1, max_size=6),
+    st.sampled_from(
+        [("", ""), ("$", ""), ("\\$", ""), ("x = ", ""), ("{", "}"), ("\\text{", "}"), ("", " apples")]
+    ),
+    st.integers(0, 999),
+)
+@settings(derandomize=True, database=None, max_examples=500)
+def test_parse_lenient_keeps_spaced_leading_sign(
+    body: str, sign: str, blanks: str, wrap: tuple[str, str], other: int
+) -> None:
+    value = Fraction(Decimal(body))
+    pre, post = wrap
+    assert parse_lenient(f"{pre}{sign}{blanks}{body}{post}") == -value
+    assert parse_lenient(f"{sign}{blanks}\\${body}") == -value
+    assert parse_lenient(f"{body} {sign} {other}") == value  # a sign between numbers is not joined
+    assert parse_lenient(f"{body} {sign} {other} = {other}") == other
+    ex = extract_v2(f"#### {sign}{blanks.replace(chr(10), ' ')}{body}")
+    assert (ex.value, ex.method) == (-value, "hash")
 
 
 # --------------------------------------------------------------------------- canonical / gold
@@ -892,7 +1070,22 @@ def test_frozen_mismatches_reports_both_sides() -> None:
 _INTS = st.integers(-100_000, 10**7).map(str)
 _DECIMALS = st.tuples(st.integers(-9_999, 9_999), st.integers(0, 999)).map(lambda t: f"{t[0]}.{t[1]}")
 _COMMAS = st.integers(1_000, 10**8).map(lambda n: f"{n:,}")
-_ODD = st.sampled_from([".5", "5.", "-.25", f"{MINUS}3", "\uff14\uff12", "007", "-0", "1/2", "3.0.1"])
+_ODD = st.sampled_from(
+    [
+        ".5",
+        "5.",
+        "-.25",
+        f"{MINUS}3",
+        "\uff14\uff12",
+        "007",
+        "-0",
+        "1/2",
+        "3.0.1",
+        "- 7",
+        f"{MINUS}  7",
+        "- .5",
+    ]
+)
 _NUMBER = st.one_of(_INTS, _DECIMALS, _COMMAS, _ODD)
 _WRAPS = st.sampled_from(
     [
@@ -912,6 +1105,13 @@ _WRAPS = st.sampled_from(
         "{} apples",
         "about {}",
         "{}{{,}}000",
+        "- {}",
+        f"{MINUS}\t{{}}",
+        "\\$ - {}",
+        "- \\${}",
+        "x = - {}",
+        "12 - {}",
+        "{} - 7 = 5",
     ]
 )
 _CONTENT = st.one_of(
@@ -939,11 +1139,14 @@ _FILLER = st.one_of(
         ]
     ),
 )
-# Markdown headings and bold step headers (never markers / never number-like bold), plus qualifying
-# but numberless '####' lines ("#### ...", "#### -.").
+# Markdown headings, numbered headings and bold step headers (never markers / never number-like bold),
+# plus numberless '####' lines ("#### ...", "#### -.", which do not qualify either).
 _HEADING = st.one_of(
     st.integers(0, 12).map(lambda k: f"\n#### Step {k}: Verify\n"),
     st.integers(0, 12).map(lambda k: f"\n#### Step {k}"),
+    st.integers(0, 12).map(lambda k: f"\n#### {k}. Verification\n"),
+    st.integers(0, 12).map(lambda k: f"\n#### {k}) Check the answer"),
+    st.integers(0, 12).map(lambda k: f"#### {k}. Final answer: "),
     st.integers(0, 12).map(lambda k: f"\n### Step {k}\n"),
     st.integers(0, 12).map(lambda k: f"**Step {k}: Add the parts**"),
     st.integers(0, 12).map(lambda k: f"**Step {k}:** "),
@@ -960,6 +1163,7 @@ _HEADING = st.one_of(
             "#### Final Answer: ",
             "\n#### ...\n",
             "\n#### -.\n",
+            "\n#### .",
         ]
     ),
 )
@@ -996,7 +1200,7 @@ def _assert_monotone(text: str, golds: list) -> None:
     _assert_well_formed(text, b)
     for ex in (a, b):  # marker and bold results come only from qualifying content
         if ex.method == "hash":
-            assert is_hash_answer(ex.content), (text, ex)
+            assert is_hash_answer(ex.content) and _spec_is_hash_answer(ex.content), (text, ex)
         if ex.method == "bold":
             assert BOLD_NUMERIC_RE.match(ex.content) and SPEC_BOLD_NUMERIC_RE.match(ex.content), (text, ex)
     if a.value is not None:
@@ -1024,25 +1228,50 @@ _DIGIT_FREE_HEADINGS = (
     "\n####",
     "\n#### \n",
     "\n### Final Answer",
+    "\n#### ...",
+    "\n#### .\n",
+    "\n#### -.",
+    "\n#### $.",
 )
 
 
 @given(RESPONSES, st.integers(0, 12))
 @settings(derandomize=True, database=None, max_examples=500, suppress_health_check=[HealthCheck.too_slow])
 def test_trailing_headings_never_change_the_answer(text: str, k: int) -> None:
-    """A heading line appended to a response is never a marker: v1 is unchanged by any heading, v2 by any
-    digit-free one (headings with digits may only feed v2's last-number stage)."""
+    """A heading (incl. numbered) or numberless "####" line appended to a response is never a marker: v1 is
+    unchanged by any of them, v2 by any digit-free one (digits may only feed v2's last-number stage)."""
     a, b = extract_v1(text), extract_v2(text)
     with_digits = (
         f"\n#### Step {k}: Verify",
         f"\n#### Step {k}\n",
         f"\n### Step {k}",
         f"\n**Step {k}: Add**",
+        f"\n#### {k}. Verification",
+        f"\n#### {k}) Check the answer\n",
     )
     for suffix in (*_DIGIT_FREE_HEADINGS, *with_digits):
         assert extract_v1(text + suffix) == a, suffix
     for suffix in _DIGIT_FREE_HEADINGS:
         assert extract_v2(text + suffix) == b, suffix
+
+
+_TITLE = st.from_regex(r"[A-Za-z][A-Za-z0-9 :,()-]{0,20}", fullmatch=True)
+_BLANKS = st.text(alphabet=" \t\u00a0\u2003", min_size=1, max_size=4)
+
+
+@given(st.integers(0, 10**6), st.sampled_from([".", ")"]), _BLANKS, _TITLE, RESPONSES)
+@settings(derandomize=True, database=None, max_examples=500, suppress_health_check=[HealthCheck.too_slow])
+def test_numbered_headings_never_qualify(n: int, punct: str, blanks: str, title: str, text: str) -> None:
+    """Any "<n>. <Title>" / "<n>) <Title>" line is not a marker for either extractor; numbers still are."""
+    heading = f"{n}{punct}{blanks}{title}"
+    assert not is_hash_answer(heading) and not _spec_is_hash_answer(heading)
+    for number in (f"{n}", f"{n}.", f"{n}.5", f"{n}{punct}", f".{n}"):
+        assert is_hash_answer(number) and _spec_is_hash_answer(number), number
+    assert extract_v1(f"#### {n}.").value == n  # "#### 4." reads 4
+    a, b = extract_v1(text), extract_v2(text)
+    assert extract_v1(f"{text}\n#### {heading}") == a
+    if b.method in ("boxed", "hash"):  # v2's marker stage is unaffected (later stages may read its digits)
+        assert extract_v2(f"{text}\n#### {heading}") == b
 
 
 def test_parse_lenient_agrees_with_strict_numbers_for_every_unicode_digit() -> None:

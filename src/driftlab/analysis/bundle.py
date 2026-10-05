@@ -17,14 +17,30 @@ the error recorded in ``meta["warnings"]`` and ``meta["empty_frames"]``. Frames 
   its trajectory, or (``ablations``) a plan without ablations, or (``schedule_random``) fewer completed rounds
   than ``plan.schedule_randomization.n_changes``;
 * ``ledger_summary``: no ledger rows (e.g. a hand-built store); ``truncation`` / ``accuracy``: no eval cells.
+
+Two integrity checks run before any analysis:
+
+* **Stale scores** (:func:`stale_scores`): a score row of the run's eval cells whose ``ext_hash`` differs from
+  the CURRENT source hash of its (registered) extractor was computed by other extractor code than the one the
+  tables name. :func:`analyze` then raises :class:`StaleScoresError` (re-score with
+  ``driftlab run -c <config> --run-dir <dir> --stages score``; ``score_all`` replaces exactly those rows)
+  unless ``allow_stale_scores=True``, which records them in ``meta["stale_scores"]`` so that every table carries
+  a ``STALE SCORES`` footnote.
+* **Pre-registration lock** (:func:`plan_lock_status`): ``meta["plan_lock"]`` compares the analysed plan file
+  (``<run_dir>/plan.yaml`` by default) with the lock that ``driftlab freeze-plan`` wrote next to the config's
+  ``analysis_plan`` (``<plan stem>.lock.json``): ``locked_before_run`` | ``locked_after_run_start`` |
+  ``no_lock`` | ``hash_mismatch``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -230,8 +246,6 @@ def _run_row(store: Store, cfg: ExperimentConfig) -> dict:
 
 
 def _provenance(run_dir: Path, run: Mapping[str, Any]) -> dict:
-    import json
-
     path = run_dir / PROVENANCE_FILE
     for raw in ((path.read_text(encoding="utf-8") if path.exists() else None), run.get("provenance_json")):
         if not raw:
@@ -243,6 +257,157 @@ def _provenance(run_dir: Path, run: Mapping[str, Any]) -> dict:
         if isinstance(out, dict):
             return out
     return {}
+
+
+# --------------------------------------------------------------------------- integrity checks
+
+
+class StaleScoresError(RuntimeError):
+    """``analyze()`` refused: some score rows were computed by other extractor code than the current one."""
+
+
+def stale_scores(db: str | Path, run_id: str) -> list[dict[str, Any]]:
+    """Score rows of the run's eval cells whose ``ext_hash`` differs from the CURRENT source hash of their
+    extractor: ``[{"extractor", "ext_hash", "current_hash", "n"}, ...]`` (empty when every row is current).
+
+    Rows of an extractor that is no longer registered have no current hash; they are reported as a warning by
+    ``analyze`` (the score stage never rewrites them) but do not count as stale here.
+    """
+    df = loader.score_status(db, run_id)
+    out: list[dict[str, Any]] = []
+    for r in df.to_dict("records") if len(df) else []:
+        cur = r.get("current_hash")
+        if cur is None or (isinstance(cur, float) and math.isnan(cur)):
+            continue
+        if str(r["ext_hash"]) != str(cur):
+            out.append(
+                {
+                    "extractor": str(r["extractor"]),
+                    "ext_hash": str(r["ext_hash"]),
+                    "current_hash": str(cur),
+                    "n": int(r["n"]),
+                }
+            )
+    return out
+
+
+def _stale_message(run_dir: Path, stale: Sequence[Mapping[str, Any]]) -> str:
+    """One-line refusal (the CLI shows the first 400 characters, so the remedy comes first)."""
+    n = sum(int(s["n"]) for s in stale)
+    detail = ", ".join(
+        f"{s['extractor']}: {int(s['n']):,} rows @{s['ext_hash']}, current @{s['current_hash']}"
+        for s in stale
+    )
+    return (
+        f"stale scores: re-score first with `driftlab run -c {run_dir / CONFIG_FILE} --run-dir {run_dir} "
+        f"--stages score` (no model calls; it replaces exactly the stale rows), or analyse them anyway with "
+        f"`driftlab analyze --allow-stale-scores` (analyze(..., allow_stale_scores=True); every table is then "
+        f"marked STALE SCORES). {n:,} score rows were computed with extractor hashes that differ from the "
+        f"current extractor source ({detail})."
+    )
+
+
+PLAN_LOCK_STATUSES: tuple[str, ...] = (
+    "locked_before_run",
+    "locked_after_run_start",
+    "no_lock",
+    "hash_mismatch",
+)
+
+
+def plan_lock_path(plan_path: str | Path) -> Path:
+    """``analysis_plans/prereg_v1.yaml`` -> ``analysis_plans/prereg_v1.lock.json`` (as ``driftlab freeze-plan``
+    writes it; same rule as :func:`driftlab.cli.lock_path`, kept here so that the analysis needs no CLI import)."""
+    p = Path(plan_path)
+    return p.with_name(p.stem + ".lock.json")
+
+
+def _utc(ts: Any) -> datetime | None:
+    """An ISO-8601 timestamp as an aware UTC datetime (``Z`` accepted; naive = UTC); None if unparsable."""
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def plan_lock_status(
+    plan_file: str | Path,
+    source_plan: str | Path,
+    run_created_at: str | None,
+    plan_hash: str | None = None,
+) -> dict[str, Any]:
+    """Was the analysed plan frozen (``driftlab freeze-plan``) before the run started?
+
+    ``plan_file`` is the plan the analysis uses (the run dir's frozen ``plan.yaml`` by default), ``source_plan``
+    the config's ``analysis_plan`` whose ``<stem>.lock.json`` holds the lock. Status:
+
+    * ``no_lock``: no lock file next to ``source_plan``;
+    * ``hash_mismatch``: the lock is unreadable, or freezes another file (``file_sha256``) or another parsed plan
+      (``plan_hash``) than the one analysed;
+    * ``locked_before_run``: the lock matches and its ``frozen_at_utc`` is earlier than ``runs.created_at``
+      (by at least one second when the lock time has whole-second precision, as freeze-plan writes it);
+    * ``locked_after_run_start``: the lock matches but was written at or after the run's start (or a timestamp
+      is missing / unparsable, so "before" cannot be shown).
+    """
+    plan_file, lock = Path(plan_file), plan_lock_path(source_plan)
+    sha = hashlib.sha256(plan_file.read_bytes()).hexdigest() if plan_file.is_file() else None
+    out: dict[str, Any] = {
+        "status": "no_lock",
+        "lock_path": str(lock),
+        "locked_at": None,
+        "run_created_at": run_created_at,
+        "plan_sha256": sha,
+        "lock_sha256": None,
+        "detail": "",
+    }
+    if not lock.is_file():
+        out["detail"] = (
+            f"no lock file at {lock} (run `driftlab freeze-plan --plan {source_plan}` before the run)"
+        )
+        return out
+    try:
+        rec = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        rec, err = None, f"{type(e).__name__}: {e}"
+    else:
+        err = "" if isinstance(rec, dict) else "not a JSON object"
+    if err or not isinstance(rec, dict):
+        out.update(status="hash_mismatch", detail=f"unreadable lock file {lock}: {err}")
+        return out
+    out["locked_at"] = rec.get("frozen_at_utc")
+    out["lock_sha256"] = rec.get("file_sha256")
+    if sha is None or rec.get("file_sha256") != sha:
+        out.update(
+            status="hash_mismatch",
+            detail=f"the lock freezes file sha256 {rec.get('file_sha256')}, the analysed plan {plan_file} has {sha}",
+        )
+        return out
+    if plan_hash is not None and rec.get("plan_hash") not in (None, plan_hash):
+        out.update(
+            status="hash_mismatch",
+            detail=f"the lock freezes plan hash {rec.get('plan_hash')}, the analysed plan has {plan_hash}",
+        )
+        return out
+    locked, started = _utc(out["locked_at"]), _utc(run_created_at)
+    # freeze-plan records whole seconds (truncated): the lock was written in [locked, locked + 1 s), so it is
+    # provably earlier than the run only if that whole interval is
+    slack = timedelta(seconds=1) if locked is not None and locked.microsecond == 0 else timedelta(0)
+    if locked is not None and started is not None and locked + slack <= started:
+        out["status"] = "locked_before_run"
+    else:
+        out["status"] = "locked_after_run_start"
+        out["detail"] = (
+            f"locked at {out['locked_at']}, run created at {run_created_at}"
+            if locked is not None and started is not None
+            else f"cannot order the lock time {out['locked_at']!r} and the run start {run_created_at!r}"
+        )
+    return out
 
 
 def policy_names(plan: AnalysisPlan) -> list[str]:
@@ -478,12 +643,17 @@ def analyze(
     log: Log = print,
     schedule_random_n: int | None = None,
     B_policy: int | None = None,
+    allow_stale_scores: bool = False,
 ) -> AnalysisBundle:
     """Build, save and return the analysis bundle of ``run_dir`` (see the module docstring).
 
     ``B`` overrides ``plan.bootstrap.B`` (every bootstrap). The H2/H3 re-simulation bootstrap uses the same
     pre-registered ``B`` unless ``B_policy`` caps it (``min(B_policy, B)`` replicates; e.g. for quick looks);
     ``schedule_random_n`` overrides ``plan.schedule_randomization.n`` (exploratory frame; smaller is faster).
+
+    Raises :class:`StaleScoresError` (before any analysis or write) when a score row of the run was computed
+    with an extractor hash other than the current one, unless ``allow_stale_scores`` (then
+    ``meta["stale_scores"]`` lists them and every table carries a ``STALE SCORES`` footnote).
     """
     t0 = time.perf_counter()
     run_dir = Path(run_dir)
@@ -503,6 +673,15 @@ def analyze(
         run_id = str(run["run_id"])
         ledger = store.ledger_rows(run_id)
         audit_rows = store.get_audit_results(run_id)
+    stale = stale_scores(db, run_id)
+    if stale and not allow_stale_scores:
+        raise StaleScoresError(_stale_message(run_dir, stale))
+    plan_lock = plan_lock_status(
+        plan_file,
+        cfg.resolve_path(cfg.analysis_plan),
+        str(run.get("created_at") or "") or None,
+        plan_hash=plan.plan_hash(),
+    )
     cube = loader.load_cube(db, run_id)
     trajs = loader.load_trajectories(db, run_id)
     attempts = loader.proposer_attempts(db, run_id)
@@ -673,6 +852,9 @@ def analyze(
         "config": cfg.model_dump(mode="json"),
         "plan": plan.model_dump(mode="json"),
         "plan_file": str(plan_file),
+        "plan_lock": plan_lock,
+        "stale_scores": stale,
+        "allow_stale_scores": bool(allow_stale_scores),
         "provenance": _provenance(run_dir, run),
         "driftlab_version": driftlab.__version__,
         "warnings": list(col.warnings),
@@ -705,6 +887,8 @@ def _store_summary(db: Path, bundle: AnalysisBundle, col: _Collector) -> None:
         "synthetic": bundle.meta["synthetic"],
         "config_hash": bundle.meta["config_hash"],
         "frame_rows": bundle.meta["frame_rows"],
+        "plan_lock_status": (bundle.meta.get("plan_lock") or {}).get("status"),
+        "stale_scores": bundle.meta.get("stale_scores") or [],
         "n_warnings": len(col.warnings),
         "hypotheses": [
             {k: _finite(v) for k, v in rec.items()}
@@ -764,6 +948,21 @@ def main_summary(bundle: AnalysisBundle) -> str:
         f"plan {m.get('plan_version', '?')} ({m.get('plan_hash', '?')}), config {m.get('config_hash', '?')}; "
         f"seeds {m.get('seeds', [])}, R={m.get('R', '?')}, N={m.get('N', '?')}",
     ]
+    lock = m.get("plan_lock")
+    if isinstance(lock, Mapping) and lock.get("status"):
+        status = str(lock["status"])
+        lines.append(
+            f"pre-registration: {status}"
+            + ("" if status == "locked_before_run" else " (plan not frozen before the run started)")
+        )
+    stale = m.get("stale_scores")
+    if isinstance(stale, list) and stale:
+        parts = ", ".join(
+            f"{s.get('extractor')}@{s.get('ext_hash')} (current @{s.get('current_hash')}, {_int(s.get('n')):,} rows)"
+            for s in stale
+            if isinstance(s, Mapping)
+        )
+        lines.append(f"STALE SCORES (analysed with --allow-stale-scores): {parts}")
     hyp = bundle.frame("hypotheses")
     if len(hyp):
         for h in ("H1", "H2", "H3"):
@@ -838,15 +1037,20 @@ __all__ = [
     "ENVIRONMENT_COLUMNS",
     "FRAME_COLUMNS",
     "LEDGER_COLUMNS",
+    "PLAN_LOCK_STATUSES",
     "TRAJECTORY_COLUMNS",
     "TRUNCATION_COLUMNS",
+    "StaleScoresError",
     "accuracy_frame",
     "analyze",
     "audit_frame",
     "environments_frame",
     "ledger_summary_frame",
     "main_summary",
+    "plan_lock_path",
+    "plan_lock_status",
     "policy_names",
+    "stale_scores",
     "trajectory_frame",
     "truncation_frame",
 ]

@@ -167,6 +167,54 @@ def test_h1_raw_rows_reproduce_pair_summary_intervals(drift_result):
         assert r["ci_hi"] == pytest.approx(s["infl_hi"] * 100, abs=1e-9)
 
 
+def test_h1_notes_state_the_direction_and_the_drivers(drift_result):
+    """H1 is two-sided ('the effect may be positive or negative'): every note says which way the observed effect
+    goes, and the overall note names the environments that drive the result with their signs."""
+    *_, df = drift_result
+    raw_e3 = row(df, "H1", "E3", "descriptive")
+    assert (
+        f"observed direction: stored references INFLATE measured win rates under E3 ({raw_e3['estimate']:+.2f} pp)"
+        in (raw_e3["note"])
+    )
+    assert "leave measured win rates unchanged under E1" in row(df, "H1", "E1", "descriptive")["note"]
+    e3 = h1_diff(df, "E3")
+    assert f"inflation under E3 is HIGHER than under the E1 control by {e3['estimate']:.2f} pp" in e3["note"]
+    overall = row(df, "H1", "overall")["note"]
+    assert "two-sided test" in overall
+    detected = [e for e in ("E2", "E3", "E4") if h1_diff(df, e)["status"] == "effect detected"]
+    undetected = [e for e in ("E2", "E3", "E4") if h1_diff(df, e)["status"] == "no effect detected"]
+    assert "E3" in detected and undetected  # this cube: extraction drift detected, pure sampling drift not
+    driven = overall.split("result driven by ")[1].split("; CI includes 0 under ")[0]
+    for e in detected:
+        assert f"{e} {h1_diff(df, e)['estimate']:+.2f} pp vs E1 (stored references INFLATE" in driven, e
+    rest = overall.split("; CI includes 0 under ")[1]
+    for e in undetected:
+        assert f"{e} {h1_diff(df, e)['estimate']:+.2f} pp vs E1" in rest, e
+
+
+def test_h1_deflation_is_an_effect_too_and_is_named():
+    """A stricter re-scoring extractor makes stored references DEFLATE measured win rates: the two-sided test
+    detects it (status rules unchanged) and the notes say DEFLATE / LOWER."""
+    cube, trajs, plan = factorial_cube(), trajs_for(), AnalysisPlan()
+    S, D, K, R, _, N = cube.correct.shape
+    s, d, k, n = np.ix_(range(S), range(D), range(K), range(N))
+    keep = np.broadcast_to(
+        ((s * 1000003 + d * 10007 + k * 101 + n * 7919) % 5 != 0)[:, :, :, None, :], (S, D, K, R, N)
+    )
+    v1 = cube.correct[..., cube.extractors.index("v1"), :]
+    cube.correct[..., cube.extractors.index("v2"), :] = np.where(
+        v1 >= 0, ((v1 == 1) & keep).astype(np.int8), -1
+    )
+    _, df = evaluate(cube, trajs, plan, B=200, B_policy=5)
+    e3 = h1_diff(df, "E3")
+    assert e3["status"] == "effect detected" and e3["ci_hi"] < 0
+    assert "inflation under E3 is LOWER than under the E1 control" in e3["note"]
+    assert "stored references DEFLATE measured win rates under E3" in e3["note"]
+    overall = row(df, "H1", "overall")
+    assert overall["status"] == "supported"
+    assert f"result driven by E3 {e3['estimate']:+.2f} pp vs E1 (stored references DEFLATE" in overall["note"]
+
+
 def test_identical_stored_and_rerun_gives_no_effect():
     cube, trajs, plan = factorial_cube(identical=True), trajs_for(), AnalysisPlan()
     _, df = evaluate(cube, trajs, plan, B_policy=10)
@@ -225,12 +273,13 @@ def test_h2_frozen_reference_has_more_false_accepts():
     assert p1["n"] == 3 * (11 + 6)
     assert p1["ci_lo"] > 0 and p1["status"] == "supported"
     assert "P2: 0/18 false accepts, 18 GT-coupled ‡" in p1["note"]
-    assert "CI excludes 0: FAR(P1) > FAR(P2)" in p1["note"]
+    assert "CI excludes 0: FAR(P1) > FAR(P2)" in p1["note"] and "P1 admitted MORE false accepts" in p1["note"]
     # adopt-on-promote removes prompt staleness: P1b equals P2 here, but every accept of both is GT-coupled
     # (greedy, reference = the incumbent's own GT cell), so 0 - 0 is a design property, not a measurement
     p1b = row(df, "H2", "P1b-P2")
     assert p1b["estimate"] == 0 and p1b["ci_lo"] == 0 and p1b["ci_hi"] == 0
     assert p1b["status"] == "inconclusive" and "‡ every accept of P1b and P2 is GT-coupled" in p1b["note"]
+    assert "observed direction: none, FAR(P1b) = FAR(P2)" in p1b["note"]
     # H3: P3 never refreshes under an unchanged env (ratio 0); its FAR equals P2's only by construction
     ratio = row(df, "H3", "P3/P2")
     assert ratio["estimate"] == 0 and ratio["unit"] == "ratio" and ratio["status"] == "supported"
@@ -367,8 +416,23 @@ def test_h2_is_two_sided_and_states_the_direction():
     assert r["estimate"] == pytest.approx(-45.0) and r["ci_hi"] < 0
     assert r["status"] == "supported"
     assert "FAR(P1) < FAR(P2)" in r["note"] and "FEWER false accepts" in r["note"]
+    assert "two-sided; estimate -45.0 pp" in r["note"]
     same = pd.DataFrame(h2_rows({"P1": p2, "P1b": p2, "P2": p2}, B, "")).iloc[0]
     assert same["status"] == "not supported" and "CI includes 0" in same["note"]
+    assert "observed direction: none, FAR(P1) = FAR(P2)" in same["note"]
+    # a non-significant difference still states its observed direction
+    p1_hi = _stats(20, 12, 0.0, acc, np.where(np.arange(B) % 2 == 0, 4, 16))  # CI straddles P2's 50 %
+    p1_lo = _stats(20, 8, 0.0, acc, np.where(np.arange(B) % 2 == 0, 4, 16))
+    up = pd.DataFrame(h2_rows({"P1": p1_hi, "P1b": p1_lo, "P2": p2}, B, ""))
+    assert list(up["status"]) == ["not supported", "not supported"]
+    assert (
+        "observed direction: FAR(P1) > FAR(P2) by 10.0 pp (P1 admitted MORE false accepts"
+        in up.iloc[0]["note"]
+    )
+    assert (
+        "observed direction: FAR(P1b) < FAR(P2) by 10.0 pp (P1b admitted FEWER false accepts"
+        in up.iloc[1]["note"]
+    )
 
 
 def _per_seed(

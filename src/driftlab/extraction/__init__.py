@@ -6,8 +6,10 @@ fingerprints reference it, and ``tests/extractors_frozen.json`` pins it. A behav
 requires a NEW version module (``v3.py``) registered under a new name, never an edit of v1 / v2.
 
 Final semantics (fixed before any real experiment run): a ``####`` is a marker only when the rest of its
-line starts like a number (``is_hash_answer``; headings such as ``#### Step 4: Verify`` are ignored by both
-extractors), and v2's bold stage only reads number-like bold spans.
+line starts like a number (a digit or ``.digit`` after an optional sign / dollar) and is not a numbered
+heading (``is_hash_answer``; ``#### Step 4: Verify``, ``#### 4. Verification``, ``#### 2) Check`` and
+``#### ...`` are ignored by both extractors); ``parse_lenient`` keeps a leading sign separated from the
+number by whitespace (``- 7`` -> -7); and v2's bold stage only reads number-like bold spans.
 """
 
 from __future__ import annotations

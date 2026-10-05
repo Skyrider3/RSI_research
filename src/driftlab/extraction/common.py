@@ -5,13 +5,17 @@ Everything that decides whether a response counts as correct lives in this modul
 references that hash, so this file must not change behaviour: a different rule becomes a NEW version
 (``v3.py``) instead. (The semantics below were finalised before any real experiment run.)
 
-Marker selection is shared on purpose: both extractors first call :func:`select_marker` and read the same
-payload (:func:`marker_payload`), and :func:`parse_lenient` returns ``Fraction(Decimal(s))`` for every
-string ``s`` that v1 accepts. Hence v1-correct implies v2-correct (monotonicity), which the analyses rely on.
+Marker selection is shared on purpose: both extractors first call :func:`select_marker` (which applies the
+``####`` qualification rule below) and read the same payload (:func:`marker_payload`), and
+:func:`parse_lenient` returns ``Fraction(Decimal(s))`` for every string ``s`` that v1 accepts. Hence
+v1-correct implies v2-correct (monotonicity), which the analyses rely on.
 
 A ``####`` is an answer marker only when the rest of its line, stripped, starts like a number
-(:data:`HASH_ANSWER_RE`, e.g. ``#### 42``, ``#### -3``, ``#### $1,234``, ``#### .5``); markdown headings
-(``#### Step 4: Verify``, ``#### Final Answer``) and empty ``####`` lines are ignored by BOTH extractors, and
+(:data:`HASH_ANSWER_RE`: a digit or ``.digit`` after an optional sign / dollar / minus, e.g. ``#### 42``,
+``#### -3``, ``#### $1,234``, ``#### .5``, ``#### 4.``) and is not a numbered heading
+(:data:`NUMBERED_HEADING_RE`: ``#### 4. Verification``, ``#### 2) Check``). Markdown headings
+(``#### Step 4: Verify``, ``#### Final Answer``), numbered headings, numberless lines (``#### ...``,
+``#### .``, ``#### -.``) and empty ``####`` lines are ignored by BOTH extractors (:func:`is_hash_answer`), and
 the LAST qualifying occurrence is used.
 """
 
@@ -29,12 +33,17 @@ METHODS: tuple[str, ...] = ("boxed", "hash", "fbox", "answer_phrase", "bold", "l
 BOX_RE = re.compile(r"\\boxed\s*\{")
 FBOX_RE = re.compile(r"\\fbox\s*\{")
 HASH_MARK = "####"
-# A "####" qualifies as an answer marker iff HASH_ANSWER_RE.match(<rest of its line, stripped>): optional
-# sign, optional (escaped) dollar, optional minus, then a digit or '.' (whitespace allowed in between; empty
-# content does not qualify). Written without adjacent "\s*" runs, so long blank runs cannot cause
-# polynomial backtracking; it accepts exactly the strings of the spec pattern
-# r"[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*[\d.]" (an equivalence test pins this).
-HASH_ANSWER_RE = re.compile(r"[-+\u2212]?\s*(?:\\?\$\s*)?(?:[-\u2212]\s*)?[\d.]")
+# A "####" qualifies as an answer marker iff, for c = <rest of its line, stripped>, HASH_ANSWER_RE.match(c)
+# and not NUMBERED_HEADING_RE.match(c) (see is_hash_answer).
+# HASH_ANSWER_RE: optional sign, optional (escaped) dollar, optional minus, then a digit or a '.' followed by
+# a digit (whitespace allowed in between; empty content, "...", "." and "-." do not qualify, ".5" does).
+# Written without adjacent "\s*" runs, so long blank runs cannot cause polynomial backtracking; it accepts
+# exactly the strings of the spec pattern r"[-+\u2212]?\s*(?:\\?\$)?\s*[-\u2212]?\s*(?:\d|\.\d)" (an
+# equivalence test pins this).
+HASH_ANSWER_RE = re.compile(r"[-+\u2212]?\s*(?:\\?\$\s*)?(?:[-\u2212]\s*)?(?:\d|\.\d)")
+# A numbered markdown heading ("4. Verification", "2) Check the answer"): never an answer marker. "42",
+# "42.", "3.5" and "4." are not headings (the '.'/')' must be followed by whitespace and a letter).
+NUMBERED_HEADING_RE = re.compile(r"\d+[.)]\s+[A-Za-z]")
 _SPACE_RE = re.compile(r"\s*")  # same character class as str.strip() (Unicode whitespace)
 # A backslash escapes the next character (so "\{" and "\}" are literal); bare braces nest.
 _BRACE_TOKEN_RE = re.compile(r"\\.|[{}]", re.S)
@@ -44,6 +53,8 @@ NUM_RE = re.compile(r"(?<![\w.])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|(?<![\w\d
 _UNWRAP_RE = re.compile(r"\\(?:textbf|textrm|text|mathrm|mathbf|mbox)\s*\{([^{}]*)\}")
 _FRAC_RE = re.compile(r"^(-?)\\[dt]?frac\{(-?[\d.,]+)\}\{(-?[\d.,]+)\}$")
 _RATIO_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$")
+# A leading minus separated from the first number by whitespace ("- 7", "-  .5"); parse_lenient joins them.
+_SPACED_SIGN_RE = re.compile(r"-\s+(?=\d|\.\d)")
 _DROP_SPACING = ("\\,", "\\!", "\\;", "\\:", "~")
 _DROP_TOKENS = ("\\$", "$", "\\%", "%", "\\left", "\\right", "^{\\circ}", "^\\circ")
 UNICODE_MINUS = "\u2212"
@@ -200,9 +211,23 @@ def strip_span(content: str, start: int) -> tuple[str, Span]:
     return stripped, (start + lead, start + lead + len(stripped))
 
 
+def _qualifies(text: str, first: int, line_end: int) -> bool:
+    """The shared ``####`` rule on ``text[first:line_end]`` (``first`` = first non-blank character).
+
+    Both patterns end in a non-blank token (a digit / a letter), so testing the unstripped tail of the line
+    is the same as testing the stripped content.
+    """
+    return (
+        HASH_ANSWER_RE.match(text, first, line_end) is not None
+        and NUMBERED_HEADING_RE.match(text, first, line_end) is None
+    )
+
+
 def is_hash_answer(content: str) -> bool:
-    """Whether the rest of a ``####`` line qualifies as an answer (stripped, starts like a number)."""
-    return HASH_ANSWER_RE.match(content.strip()) is not None
+    """Whether the rest of a ``####`` line qualifies as an answer: stripped, it starts like a number
+    (:data:`HASH_ANSWER_RE`) and is not a numbered heading (:data:`NUMBERED_HEADING_RE`)."""
+    content = content.strip()
+    return _qualifies(content, 0, len(content))
 
 
 def _last_hash(text: str) -> tuple[int, str, Span] | None:
@@ -210,7 +235,8 @@ def _last_hash(text: str) -> tuple[int, str, Span] | None:
 
     Equivalent to testing ``is_hash_answer(text[pos + 4 : end_of_line])`` for every occurrence ``pos``
     (overlapping ones included, so "##### 42" reads " 42"), but linear: each line's bounds are located once,
-    and the qualification test reads only the first non-blank characters of the rest of the line.
+    and the qualification test reads only the first characters of the rest of the line (both patterns stop
+    at the next '#', so overlapping tests on one line never re-read each other's text).
     """
     end = len(text)
     line_start, line_end = end + 1, end
@@ -221,7 +247,7 @@ def _last_hash(text: str) -> tuple[int, str, Span] | None:
             line_end = len(text) if nl < 0 else nl
             line_start = text.rfind("\n", 0, pos) + 1
         first = _SPACE_RE.match(text, start, line_end).end()  # endpos: never crosses the newline
-        if HASH_ANSWER_RE.match(text, first, line_end) is not None:
+        if _qualifies(text, first, line_end):
             content, span = strip_span(text[start:line_end], start)
             return pos, content, span
         end = pos + len(HASH_MARK) - 1  # next occurrence starts before pos (overlaps allowed)
@@ -231,7 +257,8 @@ def _last_hash(text: str) -> tuple[int, str, Span] | None:
 def last_hash_line(text: str) -> tuple[str, int, int] | None:
     """The rest of the line after the LAST QUALIFYING ``####`` (stripped) with its span, or ``None``.
 
-    Headings (``#### Step 4: Verify``, ``#### Final Answer``) and empty ``####`` lines never qualify.
+    Headings (``#### Step 4: Verify``, ``#### Final Answer``, ``#### 4. Verification``), numberless lines
+    (``#### ...``) and empty ``####`` lines never qualify.
     """
     h = _last_hash(text)
     if h is None:
@@ -311,7 +338,14 @@ def _quotient(num: str, den: str, negative: bool) -> Fraction | None:
 
 
 def parse_lenient(s: str) -> Fraction | None:
-    """Lenient numeric parse of a short answer string (box content, answer phrase, bold text)."""
+    """Lenient numeric parse of a short answer string (box content, ``####`` payload, answer phrase, bold).
+
+    Normalisation, in order: NFKC + unicode minus -> '-'; unwrap ``\\text{}``-like wrappers (3 levels); drop
+    LaTeX spacing, dollars, percents, ``\\left``/``\\right`` and degree marks (``{,}`` -> ','); strip
+    whitespace and balanced outer braces; keep only what follows the LAST '=' ("12 - 7 = 5" -> "5"). Then a
+    leading minus separated from the first number by whitespace is joined to it ("- 7", "$ - 7",
+    "x = - 7" -> -7; "3 - 4" stays 3). Value: ``\\frac{a}{b}`` / ``a/b`` as a whole, else the FIRST number.
+    """
     s = normalize(s)
     for _ in range(3):
         s, n = _UNWRAP_RE.subn(lambda m: m.group(1), s)
@@ -325,6 +359,9 @@ def parse_lenient(s: str) -> Fraction | None:
     s = strip_outer_braces(s)
     if "=" in s:
         s = s.rsplit("=", 1)[1].strip()
+    m = _SPACED_SIGN_RE.match(s)
+    if m:  # never fires on a v1-valid string (no whitespace), so the monotonicity lemma is untouched
+        s = "-" + s[m.end() :]
     m = _FRAC_RE.match(s)
     if m:
         return _quotient(m.group(2), m.group(3), negative=m.group(1) == "-")

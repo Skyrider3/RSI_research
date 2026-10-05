@@ -9,8 +9,13 @@ Rules (docs/ARCHITECTURE.md section 7): missing data renders as ``"—"`` (table
 e.g. a smoke run with R = 4 has no age-5/10 pairs); values that are identical/zero *by construction* carry
 ``‡`` and the table then ends with :data:`~driftlab.analysis.bundle_io.BY_CONSTRUCTION_NOTE`; every footnote
 list ends with the plan hash, config hash and run id, and with
-:data:`~driftlab.analysis.bundle_io.SYNTHETIC_NOTE` for synthetic bundles. The teammate's reported numbers
-(``results/reported/teammate.yaml``) only ever appear in the separate ``T3_reported`` / ``T4_reported``
+:data:`~driftlab.analysis.bundle_io.SYNTHETIC_NOTE` for synthetic bundles. The plan-hash footnote says
+``— plan not frozen`` unless ``meta["plan_lock"]`` shows the plan was locked (``driftlab freeze-plan``) before
+the run started (T1 row ``Pre-registration`` gives the details), and a bundle analysed with
+``allow_stale_scores`` puts a ``STALE SCORES`` note first in every table. Bootstrap intervals are described as
+what they are: items resampled with one shared index vector, seeds and generations held fixed (they do not
+express seed-to-seed variation; the mean ± sd across seeds does, over few seeds). The teammate's reported
+numbers (``results/reported/teammate.yaml``) only ever appear in the separate ``T3_reported`` / ``T4_reported``
 tables; they are never merged into reproduced values.
 """
 
@@ -153,7 +158,11 @@ T1_ROWS: tuple[str, ...] = (
     "Number of random seeds",
     "Prompt revision strategy",
     "Software / package versions",
+    "Pre-registration",
 )
+PLAN_NOT_FROZEN = " — plan not frozen"
+PLAN_LOCK_UNCHECKED = " — plan lock not checked"
+STALE_SCORES_PREFIX = "STALE SCORES:"
 # Headline policies: (paper label, refresh rule) exactly as in the proposal.
 PAPER_POLICIES: dict[str, tuple[str, str]] = {
     "P1": ("Frozen reference", "Never refresh"),
@@ -616,7 +625,7 @@ class _Ctx:
         return f"{word} {e['tag']}" if word else e["tag"]
 
     def env_short(self, env_id: str) -> str:
-        """``"greedy + strict v1@af054c35"``."""
+        """``"greedy + strict v1@05dd25e6"``."""
         return f"{self.decoding_short(env_id)} + {self.extractor_short(env_id)}"
 
     def env_label(self, env_id: str) -> str:
@@ -643,17 +652,69 @@ class _Ctx:
             changed[0], f"Isolates {changed[0].replace('_', ' ')} drift"
         )
 
+    # ---------------------------------------------------------------- integrity notes
+    @property
+    def plan_lock(self) -> dict[str, Any] | None:
+        """``meta["plan_lock"]`` (None for a bundle written before the pre-registration check)."""
+        lock = self.meta.get("plan_lock")
+        return dict(lock) if isinstance(lock, Mapping) and lock.get("status") else None
+
+    def plan_hash_suffix(self) -> str:
+        """Appended to every footnote that carries the plan hash: ``" — plan not frozen"`` unless the plan was
+        locked before the run started (``" — plan lock not checked"`` for a bundle without the check)."""
+        lock = self.plan_lock
+        if lock is None:
+            return PLAN_LOCK_UNCHECKED
+        return "" if lock["status"] == "locked_before_run" else PLAN_NOT_FROZEN
+
+    def stale_note(self, reported: bool = False) -> list[str]:
+        """The prominent first footnote of every table of a bundle analysed with stale scores."""
+        stale = self.meta.get("stale_scores")
+        rows = [s for s in stale if isinstance(s, Mapping)] if isinstance(stale, list) else []
+        if not rows:
+            return []
+        old = ", ".join(
+            f"{_text(s.get('extractor'))}@{_text(s.get('ext_hash'))} ({_int(s.get('n')):,} score rows)"
+            for s in rows
+        )
+        cur = ", ".join(
+            dict.fromkeys(f"{_text(s.get('extractor'))}@{_text(s.get('current_hash'))}" for s in rows)
+        )
+        note = (
+            f"{STALE_SCORES_PREFIX} computed with extractor hashes {old} that differ from the current {cur}: values "
+            "that use these extractors may not match the extractor code named in this table. Re-score "
+            "(`driftlab run -c <config> --run-dir <dir> --stages score`) and re-run the analysis before reporting."
+        )
+        if reported:
+            note += " (Applies to this run's reproduced tables, not to the transcribed numbers.)"
+        return [note]
+
+    def bootstrap_text(self) -> str:
+        """What the paired item bootstrap resamples (items only: seeds and generations are held fixed)."""
+        what = "decision test questions" if self.plan.gt.mode == "split_half" else "test questions"
+        return (
+            f"95% paired item bootstrap (B = {self.B:,}, the {self.n_decision} {what} resampled with one shared "
+            "index vector; seeds and generations held fixed)"
+        )
+
+    def seed_sd_text(self) -> str:
+        seeds = "seed" if self.S == 1 else "seeds"
+        return (
+            f"Mean ± sd across seeds reflects trajectory-to-trajectory variation over only {self.S} {seeds}."
+        )
+
     # ---------------------------------------------------------------- footnote trailer
     def trailer(self, has_dagger: bool, reported: bool = False) -> list[str]:
         ph, ch = self.bundle.plan_hash or "?", str(self.meta.get("config_hash", "?"))
         version = self.meta.get("plan_version", self.plan.version)
+        nf = self.plan_hash_suffix()
         if reported:
             prov = (
-                f"Shown alongside run {self.run_id} (analysis plan {version}, plan hash {ph}, config hash {ch}); "
-                "these transcribed numbers do not come from that run."
+                f"Shown alongside run {self.run_id} (analysis plan {version}, plan hash {ph}{nf}, config hash "
+                f"{ch}); these transcribed numbers do not come from that run."
             )
         else:
-            prov = f"Analysis plan {version} (plan hash {ph}); config hash {ch}; run {self.run_id}."
+            prov = f"Analysis plan {version} (plan hash {ph}){nf}; config hash {ch}; run {self.run_id}."
         out = [prov]
         if has_dagger:
             out.append(BY_CONSTRUCTION_NOTE)
@@ -804,13 +865,14 @@ def _finish(
     reported: bool = False,
     title: str | None = None,
 ) -> TableSpec:
-    """Attach the "—" note and the provenance trailer (‡ / synthetic notes) to both versions."""
+    """Attach the "—" note and the provenance trailer (‡ / synthetic notes) to both versions; a bundle analysed
+    with stale scores gets the ``STALE SCORES`` note first."""
     dash_note = (
         "— = not available in this run (no data for that cell, e.g. no pairs at that age or no accepts)."
     )
 
     def assemble(frames: Sequence[pd.DataFrame | None], extra: list[str]) -> list[str]:
-        out = list(notes) + list(extra)
+        out = ctx.stale_note(reported) + list(notes) + list(extra)
         if not reported:
             if any(_contains(f, DASH) for f in frames):
                 out.append(dash_note)
@@ -872,6 +934,63 @@ def _gpu(ctx: _Ctx) -> str:
     return str(dev) if dev else "none detected (CPU)"
 
 
+def _short_ts(ts: Any) -> str:
+    """``"2026-10-05T12:00:00+00:00"`` -> ``"2026-10-05T12:00Z"`` (unparsable: the text itself, or ``"?"``)."""
+    from datetime import datetime, timezone
+
+    s = _text(ts).strip()
+    if not s:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s)
+    except ValueError:
+        return s
+    dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _repo_relative(path: str) -> str:
+    """``path`` relative to the repository root when it lies inside it (no local prefixes in tables)."""
+    if not path:
+        return ""
+    try:
+        return Path(path).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except (ValueError, OSError):
+        return path
+
+
+def _sha8(v: Any) -> str:
+    s = _text(v)
+    return f"{s[:8]}…" if s else "?"
+
+
+def prereg_text(meta: Mapping[str, Any]) -> str:
+    """Human-readable pre-registration status (T1 row ``Pre-registration``) from ``meta["plan_lock"]``."""
+    lock = meta.get("plan_lock") if isinstance(meta, Mapping) else None
+    if not isinstance(lock, Mapping) or not lock.get("status"):
+        return "Not checked: the bundle was written before the pre-registration lock check"
+    version = _text(meta.get("plan_version"), "?") or "?"
+    status = _text(lock.get("status"))
+    sha = _sha8(lock.get("plan_sha256"))
+    at = _short_ts(lock.get("locked_at"))
+    if status == "locked_before_run":
+        return f"Plan {version} locked {at} before the run started (sha256 {sha})"
+    if status == "locked_after_run_start":
+        return (
+            f"Plan {version} locked {at}, after the run started ({_short_ts(lock.get('run_created_at'))}): "
+            f"not a pre-registration of this run (sha256 {sha})"
+        )
+    if status == "no_lock":
+        return "No lock file: analysis plan not frozen"
+    if status == "hash_mismatch":
+        name = Path(_text(lock.get("lock_path"))).name or "the lock file"
+        return (
+            f"Lock file {name} freezes a different plan (sha256 {_sha8(lock.get('lock_sha256'))}) than the one "
+            f"analysed (sha256 {sha}): analysis plan not frozen"
+        )
+    return f"Unknown lock status {status!r}: analysis plan not verified as frozen"
+
+
 def _build_t1(ctx: _Ctx) -> TableSpec:
     cfg, plan = ctx.cfg, ctx.plan
     model = cfg.get("model") or {}
@@ -919,6 +1038,7 @@ def _build_t1(ctx: _Ctx) -> TableSpec:
         "Number of random seeds": f"{ctx.S} (seeds {seeds})" if ctx.S else DASH,
         "Prompt revision strategy": strategy,
         "Software / package versions": _versions(ctx),
+        "Pre-registration": prereg_text(ctx.meta),
     }
     rows = [[k, values[k]] for k in T1_ROWS]
     matrix = cfg.get("matrix") or {}
@@ -956,6 +1076,7 @@ def _build_t1(ctx: _Ctx) -> TableSpec:
             "Analysis plan hash",
             f"{ctx.bundle.plan_hash or '?'} ({ctx.meta.get('plan_version', plan.version)})",
         ],
+        ["Plan lock file", _repo_relative(_text((ctx.plan_lock or {}).get("lock_path"))) or DASH],
         ["Config hash", str(ctx.meta.get("config_hash", "?"))],
         ["Git commit", commit],
         ["Engine fingerprint", _text(ctx.meta.get("engine_fp"), "?")],
@@ -1488,14 +1609,15 @@ def _build_t4(ctx: _Ctx) -> TableSpec:
         f"Mean ± standard deviation over {ctx.S} seeds of the per-seed means; win rate = share of the "
         f"{ctx.n_decision} test questions the candidate answers correctly and the reference does not. Rerun "
         "reference = the same reference prompt regenerated in the candidate's round under the current environment.",
+        ctx.seed_sd_text(),
         *_construction_notes(cells),
         *ctx.skipped_note(),
     ]
     ext_notes = [
-        f"Pooled inflation = Σ over pairs / Σ n with a 95% paired item bootstrap CI (B = {ctx.B:,}, one resampled "
-        "item vector per replicate, stratified by seed). Extraction part = stored − re-scored win rate (same text, "
-        "current extractor); generation part = re-scored − rerun win rate; they sum to the inflation. Flip rate = "
-        "share of pairs where the stored and the rerun reference lead to different promotion decisions."
+        f"Pooled inflation = Σ over pairs / Σ n; brackets: {ctx.bootstrap_text()}. Extraction part = stored − "
+        "re-scored win rate (same text, current extractor); generation part = re-scored − rerun win rate; they sum "
+        "to the inflation. Flip rate = share of pairs where the stored and the rerun reference lead to different "
+        "promotion decisions."
     ]
     return _finish(
         ctx,
@@ -1617,7 +1739,8 @@ def _build_t7(ctx: _Ctx) -> TableSpec:
         "in the candidate's round under the environment shown.",
         f"Drift inflation = stored-reference win rate − rerun-reference win rate, pooled over every candidate and "
         f"reference pair that are k rounds apart in all {ctx.S} seeds ({ctx.n_decision} test questions each); "
-        f"brackets: 95% paired item bootstrap CI (B = {ctx.B:,}, stratified by seed).",
+        f"brackets: {ctx.bootstrap_text()}.",
+        ctx.seed_sd_text(),
         "False-accept rate: share of candidates accepted against the stored reference whose ground-truth accuracy "
         "is no better than the current incumbent's under the same environment (false accepts / accepts in "
         "parentheses, pooled over seeds).",
@@ -1755,7 +1878,7 @@ def _build_t7b(ctx: _Ctx) -> TableSpec:
     notes = [
         f"Every reference age 0..{ctx.R_done} of the factorial all-pairs analysis (plus the Table 7 ages) × "
         f"environment; references stored under {ctx.plan.storage_env} with storage-time scores. Pooled over seeds; "
-        f"inflation brackets: 95% paired item bootstrap CI (B = {ctx.B:,}).",
+        f"inflation brackets: {ctx.bootstrap_text()}.",
         "False-accept rates are against the current incumbent's ground truth: stored reference (scores kept), "
         "rerun reference (same prompt regenerated now) and fresh reference (current incumbent regenerated now); "
         "false accepts / accepts in parentheses.",
@@ -1769,6 +1892,7 @@ def _build_t7b(ctx: _Ctx) -> TableSpec:
         _frame(rows, PAPER_COLUMNS["T7b"]),
         _frame(ext_rows, ext_cols),
         notes,
+        [ctx.seed_sd_text()],  # the extended grid adds a mean ± sd over seeds column
         caption="Full grid behind Table 7.",
     )
 
@@ -2194,6 +2318,7 @@ def _build_t9(ctx: _Ctx) -> TableSpec:
         f"Ground-truth accuracy: final shadow incumbent under {ctx.plan.gt.canonical_env}; false-accept rate: false "
         "accepts / accepts of that seed (— without accepts; the mean row averages seeds with accepts). "
         + ctx.convention_text(),
+        ctx.seed_sd_text(),
         *ctx.far_notes(ctx.headline),
         *ctx.skipped_note(),
     ]
@@ -2422,6 +2547,7 @@ __all__ = [
     "per_seed_policy_frame",
     "pct_mean_sd",
     "pp_mean_sd",
+    "prereg_text",
     "table_label",
     "with_ci",
     "write_tables",

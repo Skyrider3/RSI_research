@@ -10,10 +10,12 @@ Run dir layout::
     exports/analysis/  analysis bundle;  exports/tables/  T1-T10 (md/csv/tex)
 
 Stages (``STAGES``) are idempotent and resumable: each computes planned - done from the store and does only
-the rest, so re-running a finished run makes no model calls. ``max_minutes`` is a soft deadline checked by the
-engine between chunks; on expiry ``run()`` returns ``{"status": "budget_exhausted", ...}`` with everything
-finished so far committed. Restore (Colab): put a ``Store.backup_to`` snapshot at ``<run_dir>/store.sqlite``
-and point ``shard_dir`` at the shard log; ``open()`` replays newer shards BEFORE creating the shard writer.
+the rest, so re-running a finished run makes no model calls (the score stage re-scores, without model calls,
+any score row whose extractor source hash changed, so the analyze stage after it never sees stale scores).
+``max_minutes`` is a soft deadline checked by the engine between chunks; on expiry ``run()`` returns
+``{"status": "budget_exhausted", ...}`` with everything finished so far committed. Restore (Colab): put a
+``Store.backup_to`` snapshot at ``<run_dir>/store.sqlite`` and point ``shard_dir`` at the shard log; ``open()``
+replays newer shards BEFORE creating the shard writer.
 """
 
 from __future__ import annotations
@@ -487,6 +489,10 @@ class Pipeline:
         return {"rows": len(rows), "scored": scored}
 
     def _stage_analyze(self, engine: GenerationEngine) -> dict:
+        """Analysis bundle + paper tables. ``analyze`` refuses stale scores (rows computed by an older extractor
+        source: :class:`~driftlab.analysis.bundle.StaleScoresError`); a default ``run()`` always runs the score
+        stage first, whose ``score_all`` replaces exactly those rows, so the refusal can only surface when
+        ``analyze`` is requested without ``score`` on a run whose extractor code changed since scoring."""
         store = self._store()
         try:
             from driftlab.analysis.bundle import analyze

@@ -8,7 +8,10 @@
   environments. Per env: ``effect detected`` iff the difference CI excludes 0 (two-sided: the sign under a
   decoding change is not pre-registered). Overall: ``supported`` iff some changed env shows an effect,
   ``not supported`` if none does, ``inconclusive`` if no changed env has any pair. Notes carry ‡ whenever some
-  (``k of n``) or all pairs of an env are identical by construction, or their generation part is.
+  (``k of n``) or all pairs of an env are identical by construction, or their generation part is. H1 is
+  two-sided by the proposal's wording ("the effect may be positive or negative"), so every note states the
+  observed direction (stored references INFLATE / DEFLATE measured win rates; a contrast is HIGHER / LOWER
+  than the control) and the overall note names the environments that drive the result, with their signs.
 * **H2** (unit ``pp of FAR``): ``FAR(P1) - FAR(P2)`` and ``FAR(P1b) - FAR(P2)``, FAR pooled over the seeds
   BOTH policies of the contrast cover (false accepts / accepts). The CI resamples items (one index vector per
   replicate shared by every seed and policy; ``split_half`` resamples the decision half and the GT half
@@ -16,7 +19,8 @@
   a FAR is undefined (no accepts) are dropped and counted in the note. Status, in order: ``inconclusive`` if
   either policy has fewer than :data:`MIN_ACCEPTS` accepts in total, if every accept of both policies is
   GT-coupled (both FARs are 0 by construction, ‡), or if there is no CI; ``supported`` if the CI excludes 0
-  (two-sided, as pre-registered; the note states the direction); otherwise ``not supported``.
+  (two-sided, as pre-registered: "FAR will differ"); otherwise ``not supported``. Every note states the
+  observed direction (which policy admitted MORE / FEWER false accepts per accept, and by how many pp).
 * **H3**: the reference-call ratio ``calls_reference(P3) / calls_reference(P2)`` (deterministic, unit
   ``ratio``) and ``FAR(P3) - FAR(P2)`` (bootstrap CI and the accept / GT-coupling / no-CI guards as in H2)
   against ``plan.h3_equivalence_margin_pp``: ``supported`` iff ratio < 1 and the CI lies inside
@@ -112,6 +116,53 @@ def _join(*parts: str) -> str:
     return "; ".join(p for p in parts if p)
 
 
+def _win_rate_effect(pp: float) -> str:
+    """What a raw inflation (stored - rerun win rate, pp) means for measured win rates."""
+    if pp > 0:
+        return "stored references INFLATE measured win rates"
+    if pp < 0:
+        return "stored references DEFLATE measured win rates"
+    return "stored references leave measured win rates unchanged"
+
+
+def _raw_direction(env: str, pp: float) -> str:
+    """Observed direction of a raw H1 inflation row (``""`` without an estimate)."""
+    if not np.isfinite(pp):
+        return ""
+    return f"observed direction: {_win_rate_effect(pp)} under {env} ({pp:+.2f} pp)"
+
+
+def _contrast_direction(env: str, control: str, pp: float, raw: float) -> str:
+    """Observed direction of an H1 changed-minus-control contrast (two-sided test), with the raw sign."""
+    if not np.isfinite(pp):
+        return ""
+    if pp > 0:
+        rel = f"inflation under {env} is HIGHER than under the {control} control by {pp:.2f} pp"
+    elif pp < 0:
+        rel = f"inflation under {env} is LOWER than under the {control} control by {-pp:.2f} pp"
+    else:
+        rel = f"inflation under {env} equals the {control} control"
+    raw_s = f" ({_win_rate_effect(raw)} under {env}: {raw:+.2f} pp)" if np.isfinite(raw) else ""
+    return f"observed direction: {rel}{raw_s}"
+
+
+def _far_direction(a: str, b: str, pp: float) -> str:
+    """Observed direction of a FAR contrast ``FAR(a) - FAR(b)`` in pp (H2 is two-sided: 'FAR will differ')."""
+    if not np.isfinite(pp):
+        return f"no observed direction (FAR of {a} or {b} undefined)"
+    if pp > 0:
+        return (
+            f"observed direction: FAR({a}) > FAR({b}) by {pp:.1f} pp ({a} admitted MORE false accepts per "
+            f"accept than {b})"
+        )
+    if pp < 0:
+        return (
+            f"observed direction: FAR({a}) < FAR({b}) by {-pp:.1f} pp ({a} admitted FEWER false accepts per "
+            f"accept than {b})"
+        )
+    return f"observed direction: none, FAR({a}) = FAR({b})"
+
+
 # --------------------------------------------------------------------------- H1
 
 
@@ -186,12 +237,19 @@ def h1_rows(
         return ""
 
     rows: list[dict] = []
+    raw_pp: dict[str, float] = {}
     for env in [control, *changed]:
         if env not in keys:
             continue
         arr = arrays(env, keys[env])
         est, lo, hi = paired_bootstrap_ci(arr, B, seed, indices=idx) if arr else (_NAN,) * 3
-        note = _join("control" if env == control else "", flags(env), missing(env))
+        raw_pp[env] = float(est) * 100
+        note = _join(
+            "control" if env == control else "",
+            _raw_direction(env, raw_pp[env]),
+            flags(env),
+            missing(env),
+        )
         rows.append(
             _row(
                 "H1",
@@ -208,6 +266,7 @@ def h1_rows(
         )
 
     statuses: list[str] = []
+    contrast_pp: dict[str, float] = {}
     ctrl_keys = set(keys.get(control, []))
     for env in changed:
         common = sorted(set(keys[env]) & ctrl_keys)
@@ -224,8 +283,10 @@ def h1_rows(
             est = lo = hi = _NAN
             status = NO_DATA
         statuses.append(status)
+        contrast_pp[env] = float(est) * 100
         note = _join(
             no_ci,
+            _contrast_direction(env, control, contrast_pp[env], raw_pp.get(env, _NAN)),
             flags(control),
             flags(env),
             missing(env),
@@ -252,10 +313,26 @@ def h1_rows(
     else:
         overall, note = INCONCLUSIVE, f"no decidable contrast at age {age} under any changed environment"
     detected = [e for e, s in zip(changed, statuses, strict=True) if s == EFFECT]
+    undetected = [e for e, s in zip(changed, statuses, strict=True) if s == NO_EFFECT]
     no_data = [e for e, s in zip(changed, statuses, strict=True) if s == NO_DATA]
+
+    def signed(envs: Sequence[str]) -> str:
+        """``E2 -1.20 pp vs E1 (stored references DEFLATE measured win rates under E2: -1.20 pp)``, ..."""
+        out = []
+        for e in envs:
+            raw = raw_pp.get(e, _NAN)
+            raw_s = f" ({_win_rate_effect(raw)} under {e}: {raw:+.2f} pp)" if np.isfinite(raw) else ""
+            out.append(f"{e} {contrast_pp[e]:+.2f} pp vs {control}{raw_s}")
+        return ", ".join(out)
+
     note = _join(
         note,
+        "two-sided test (pre-registered: the effect may be positive or negative)",
         f"effect detected under {', '.join(detected)}" if detected else "",
+        f"result driven by {signed(detected)}" if detected else "",
+        (f"CI includes 0 under {signed(undetected)}" if detected else f"observed signs: {signed(undetected)}")
+        if undetected
+        else "",
         f"no data under {', '.join(no_data)}" if no_data and len(no_data) < len(changed) else "",
         f"B={B}",
     )
@@ -545,15 +622,18 @@ def h2_rows(stats: Mapping[str, _PolicyStats], B_policy: int, err: str) -> list[
         why = _far_guard(a, b, sa, sb, lo, hi)
         if why:
             status = INCONCLUSIVE
-        elif _excludes_zero(lo, hi):
+            why = _join(why, _far_direction(a, b, est))
+        elif _excludes_zero(lo, hi):  # two-sided, as pre-registered ("FAR will differ"); say which way
             status = SUPPORTED
             why = (
-                f"CI excludes 0: FAR({a}) > FAR({b})"
+                f"CI excludes 0: FAR({a}) > FAR({b}) (two-sided; estimate {est:+.1f} pp): {a} admitted MORE "
+                f"false accepts per accept than {b}"
                 if lo > 0
-                else f"CI excludes 0 with FAR({a}) < FAR({b}): {a} admitted FEWER false accepts than {b}"
+                else f"CI excludes 0 with FAR({a}) < FAR({b}) (two-sided; estimate {est:+.1f} pp): {a} admitted "
+                f"FEWER false accepts than {b}"
             )
         else:
-            status, why = NOT_SUPPORTED, "CI includes 0"
+            status, why = NOT_SUPPORTED, _join("CI includes 0 (two-sided)", _far_direction(a, b, est))
         note = _join(
             why,
             paired_note,

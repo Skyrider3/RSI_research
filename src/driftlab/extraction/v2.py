@@ -8,8 +8,10 @@
    number-like (``BOLD_NUMERIC_RE``)                                          -> "bold"
 5. the last number in the NFKC-normalised response                            -> "last_number"
 
-Only QUALIFYING ``####`` lines are markers (shared rule, ``common.HASH_ANSWER_RE``): a heading such as
-``#### Step 3`` or ``#### Final Answer`` is not a marker, so the later stages decide. The bold stage accepts
+Only QUALIFYING ``####`` lines are markers (shared rule, ``common.is_hash_answer``): a heading such as
+``#### Step 3``, ``#### Final Answer`` or ``#### 4. Verification`` and a numberless line such as ``#### ...``
+are not markers, so the later stages decide. ``parse_lenient`` keeps a leading sign separated from the
+number by whitespace (``#### - 7``, ``\\boxed{$ - 7}``, ``**- 7**`` -> -7). The bold stage accepts
 ``**42**``, ``**$1,234**``, ``**18 dollars**``, ``**25%**``, ``**x = 18**``, ``**3.5 hours.**``, ``**-7**``
 and skips step headers / equations such as ``**Step 3: Add the parts**`` or ``**Total = 5 + 13 = 18**``.
 

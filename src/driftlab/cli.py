@@ -245,7 +245,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from driftlab.reporting.render import ALL_TABLES, write_tables
 
     run_dir = _run_dir(args.run_dir, ("config.yaml", "store.sqlite"))
-    bundle = analyze(run_dir, B=args.B, log=_log(args.quiet))
+    bundle = analyze(
+        run_dir, B=args.B, log=_log(args.quiet), allow_stale_scores=bool(args.allow_stale_scores)
+    )
     out = run_dir / "exports" / "tables"
     write_tables(bundle, out)
     _print(main_summary(bundle))
@@ -559,6 +561,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("analyze", cmd_analyze, "build the analysis bundle and the paper tables of a run")
     sp.add_argument("--run-dir", required=True)
     sp.add_argument("--B", type=int, default=None, help="bootstrap replicates (default: the plan's B)")
+    sp.add_argument(
+        "--allow-stale-scores",
+        action="store_true",
+        help="analyse score rows computed by an older extractor source instead of refusing (every table is "
+        "then marked STALE SCORES; normally re-score with `driftlab run ... --stages score`)",
+    )
     sp.add_argument("-q", "--quiet", action="store_true", help="suppress progress messages")
 
     sp = add("tables", cmd_tables, "write the paper tables (md/csv/tex) from a run's analysis bundle")

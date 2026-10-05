@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -355,3 +356,143 @@ def test_demo_sized_analyze_is_fast(tmp_path: Path):
     assert bundle.meta["B_policy"] == 2000  # the pre-registered B for H2/H3 as well
     assert bundle.meta["empty_frames"] == {}
     assert not [w for w in bundle.meta["warnings"] if "failed" in w]
+
+
+# --------------------------------------------------------------------------- integrity checks
+
+
+QUICK = dict(B=20, store_results=False, B_policy=5, schedule_random_n=2, log=lambda _m: None)
+
+
+def _set_ext_hash(db: Path, extractor: str, ext_hash: str) -> int:
+    con = sqlite3.connect(db)
+    try:
+        n = con.execute("UPDATE scores SET ext_hash = ? WHERE extractor = ?", (ext_hash, extractor)).rowcount
+        con.commit()
+    finally:
+        con.close()
+    return int(n)
+
+
+def test_stale_scores_are_refused_unless_allowed(tmp_path: Path):
+    from driftlab.analysis.bundle import StaleScoresError, stale_scores
+    from driftlab.extraction import extractor_hash
+    from driftlab.reporting.tables import build_tables
+    from driftlab.scoring import score_all
+
+    b = build_run(tmp_path, R=2, N=4, audit_repeats=1)
+    assert stale_scores(b.db, b.run_id) == []
+    assert _set_ext_hash(b.db, "v2", "0123456789ab") > 0
+    stale = stale_scores(b.db, b.run_id)
+    assert [(s["extractor"], s["ext_hash"], s["current_hash"]) for s in stale] == [
+        ("v2", "0123456789ab", extractor_hash("v2"))
+    ]
+    with pytest.raises(StaleScoresError) as err:
+        analyze(b.run_dir, **QUICK)
+    msg = str(err.value)
+    assert f"driftlab run -c {b.run_dir / 'config.yaml'} --run-dir {b.run_dir} --stages score" in msg
+    assert "--allow-stale-scores" in msg and "0123456789ab" in msg
+    assert msg.index("--stages score") < 400  # the CLI shows the first 400 characters of a one-line error
+    assert not has_bundle(b.run_dir)  # refused before anything was written
+
+    allowed = analyze(b.run_dir, allow_stale_scores=True, **QUICK)
+    assert allowed.meta["allow_stale_scores"] is True and allowed.meta["stale_scores"] == stale
+    assert any("use source hash 0123456789ab" in w for w in allowed.meta["warnings"])
+    assert load_bundle(b.run_dir).meta["stale_scores"] == stale
+    assert "STALE SCORES" in main_summary(allowed)
+    for tid, spec in build_tables(allowed, reported={}).items():
+        assert spec.footnotes[0].startswith("STALE SCORES: computed with extractor hashes v2@0123456789ab"), (
+            tid
+        )
+
+    with Store(
+        b.db
+    ) as st:  # the score stage replaces the stale rows (and those of non-eval cells: dev, proposer)
+        assert score_all(st, b.run_id)["v2"] >= stale[0]["n"]
+    fresh = analyze(b.run_dir, **QUICK)
+    assert fresh.meta["stale_scores"] == [] and "STALE SCORES" not in main_summary(fresh)
+    assert not any(n.startswith("STALE") for n in build_tables(fresh, reported={})["T3"].footnotes)
+
+
+def test_unregistered_extractor_rows_are_not_stale(tmp_path: Path):
+    """Rows of an extractor that is no longer registered can never be re-scored by the score stage: they are a
+    warning, not a refusal."""
+    from driftlab.analysis.bundle import stale_scores
+
+    b = build_run(tmp_path, R=1, N=4, audit_repeats=1)
+    con = sqlite3.connect(b.db)
+    try:
+        con.execute(
+            "INSERT INTO scores (gen_key, extractor, ext_hash, extracted, method, gold, correct) "
+            "SELECT gen_key, 'v0', 'retired00000', extracted, method, gold, correct FROM scores WHERE extractor = 'v1'"
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert stale_scores(b.db, b.run_id) == []
+    bundle = analyze(b.run_dir, **QUICK)
+    assert bundle.meta["stale_scores"] == []
+    assert any("extractor v0 use source hash retired00000" in w for w in bundle.meta["warnings"])
+
+
+def test_plan_lock_status_in_meta_and_t1(tmp_path: Path):
+    from driftlab.analysis.bundle import PLAN_LOCK_STATUSES, plan_lock_status
+    from driftlab.cli import freeze_plan, lock_path
+    from driftlab.config import REPO_ROOT
+    from driftlab.reporting.tables import build_tables
+
+    plan_src = tmp_path / "plans" / "prereg_v1.yaml"
+    plan_src.parent.mkdir()
+    plan_src.write_bytes((REPO_ROOT / "analysis_plans" / "prereg_v1.yaml").read_bytes())
+    b = build_run(tmp_path, R=1, N=4, audit_repeats=1, overrides=[f"analysis_plan={plan_src}"])
+    lock = lock_path(plan_src)
+
+    def status() -> tuple[dict, str, str]:
+        bundle = analyze(b.run_dir, **QUICK)
+        t1 = build_tables(bundle, reported={})["T1"]
+        row = dict(zip(t1.df["Component"], t1.df["Configuration"], strict=True))["Pre-registration"]
+        prov = next(n for n in t1.footnotes if bundle.plan_hash in n)
+        assert load_bundle(b.run_dir).meta["plan_lock"] == bundle.meta["plan_lock"]
+        assert bundle.meta["plan_lock"]["status"] in PLAN_LOCK_STATUSES
+        return bundle.meta["plan_lock"], row, prov
+
+    pl, row, prov = status()
+    assert pl["status"] == "no_lock" and pl["lock_path"] == str(lock) and pl["locked_at"] is None
+    assert pl["plan_sha256"] == hashlib.sha256((b.run_dir / "plan.yaml").read_bytes()).hexdigest()
+    assert pl["run_created_at"] and row == "No lock file: analysis plan not frozen"
+    assert prov.endswith(f"run {b.run_id}.") and " — plan not frozen;" in prov
+
+    freeze_plan(plan_src)  # frozen now, i.e. after the run was created
+    pl, row, prov = status()
+    assert pl["status"] == "locked_after_run_start" and pl["locked_at"]
+    assert "after the run started" in row and " — plan not frozen" in prov
+
+    rec = json.loads(lock.read_text())
+    lock.write_text(json.dumps({**rec, "frozen_at_utc": "2026-01-02T03:04:05+00:00"}))
+    pl, row, prov = status()
+    assert pl["status"] == "locked_before_run"
+    assert (
+        row
+        == f"Plan prereg_v1 locked 2026-01-02T03:04Z before the run started (sha256 {pl['plan_sha256'][:8]}…)"
+    )
+    assert "not frozen" not in prov
+
+    lock.write_text(
+        json.dumps({**rec, "frozen_at_utc": "2026-01-02T03:04:05+00:00", "file_sha256": "ab" * 32})
+    )
+    pl, row, prov = status()
+    assert pl["status"] == "hash_mismatch" and row.startswith(
+        "Lock file prereg_v1.lock.json freezes a different"
+    )
+    assert " — plan not frozen" in prov
+    lock.write_text("{not json")
+    assert status()[0]["status"] == "hash_mismatch"
+
+    # whole-second lock times: a lock written in the run's starting second is not provably earlier
+    lock.write_text(json.dumps({**rec, "frozen_at_utc": "2026-01-02T03:04:05+00:00"}))
+    run_plan = b.run_dir / "plan.yaml"
+    assert (
+        plan_lock_status(run_plan, plan_src, "2026-01-02T03:04:05.900Z")["status"] == "locked_after_run_start"
+    )
+    assert plan_lock_status(run_plan, plan_src, "2026-01-02T03:04:06.000Z")["status"] == "locked_before_run"
+    assert plan_lock_status(run_plan, plan_src, None)["status"] == "locked_after_run_start"

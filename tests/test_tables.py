@@ -141,6 +141,7 @@ T1_ROWS = [
     "Number of random seeds",
     "Prompt revision strategy",
     "Software / package versions",
+    "Pre-registration",
 ]
 T10_ROWS = [
     "Reference manager",
@@ -410,6 +411,7 @@ def test_t1_rows(specs):
     )
     assert vals["Number of random seeds"] == "2 (seeds 0, 1)"
     assert "numpy 2.0" in vals["Software / package versions"]
+    assert vals["Pre-registration"].startswith("Not checked")  # the fixture bundle carries no plan_lock
     ext = specs["T1"].extended
     ext_vals = dict(zip(ext["Component"], ext["Configuration"], strict=True))
     for key in (
@@ -1155,3 +1157,107 @@ def test_all_tables_header_lists_analysis_warnings(bundle, tmp_path):
     assert dict(zip(ext["Component"], ext["Configuration"], strict=True))["Analysis warnings"].startswith(
         "1: "
     )
+
+
+# --------------------------------------------------------------------------- CI wording, plan lock, stale scores
+
+BOOTSTRAP_TEXT = (
+    f"95% paired item bootstrap (B = 50, the {N} test questions resampled with one shared index vector; seeds and "
+    "generations held fixed)"
+)
+SEED_SD_TEXT = (
+    f"Mean ± sd across seeds reflects trajectory-to-trajectory variation over only {len(SEEDS)} seeds."
+)
+REP = {
+    "source": "Proposal doc (test).",
+    "T3": [{"policy": "P1", "refresh_rule": "Never refresh", "gt_acc": "1", "far": "2", "model_calls": "3",
+            "refreshes": "0"}],
+    "T4": [{"env": "Unchanged", "age": 3, "stored_win": "1", "rerun_win": "1", "inflation": "0"}],
+}  # fmt: skip
+
+
+def _lock(status: str, **kw) -> dict:
+    return {
+        "status": status,
+        "lock_path": "/repo/analysis_plans/prereg_v1.lock.json",
+        "locked_at": "2026-10-05T12:00:07+00:00",
+        "run_created_at": "2026-10-05T13:30:00.000Z",
+        "plan_sha256": "abcd1234ef" + "0" * 54,
+        "lock_sha256": "abcd1234ef" + "0" * 54,
+        **kw,
+    }
+
+
+def _all_notes(specs: dict) -> list[str]:
+    return [n for spec in specs.values() for ext in (False, True) for n in spec.notes(ext)]
+
+
+def test_bootstrap_footnotes_say_what_is_resampled(specs):
+    everything = _all_notes(specs) + [spec.caption for spec in specs.values()]
+    assert not [n for n in everything if "stratif" in n.lower()]
+    assert any(BOOTSTRAP_TEXT in n for n in specs["T4"].notes(True))  # pooled CI column (extended)
+    for tid in ("T7", "T7b"):
+        assert any(BOOTSTRAP_TEXT in n for n in specs[tid].footnotes), tid
+    for tid in ("T4", "T7", "T9"):
+        for ext in (False, True):
+            assert SEED_SD_TEXT in specs[tid].notes(ext), (tid, ext)
+    assert SEED_SD_TEXT in specs["T7b"].notes(True)
+    assert list(specs["T4"].df.columns) == EXPECTED_HEADERS["T4"]  # paper headers unchanged
+
+
+def test_split_half_bootstrap_counts_the_decision_half(bundle):
+    plan = PLAN.model_dump(mode="json")
+    plan["gt"]["mode"] = "split_half"
+    out = build_tables(_with(bundle, {"plan": plan}), reported=NO_REPORTED)
+    assert any(f"the {N // 2} decision test questions resampled" in n for n in out["T7"].footnotes)
+
+
+def test_prereg_row_and_plan_hash_suffix(bundle):
+    cases = {
+        "locked_before_run": ("Plan prereg_v1 locked 2026-10-05T12:00Z before the run started (sha256 abcd1234…)", ""),
+        "locked_after_run_start": ("Plan prereg_v1 locked 2026-10-05T12:00Z, after the run started", " — plan not frozen"),
+        "no_lock": ("No lock file: analysis plan not frozen", " — plan not frozen"),
+        "hash_mismatch": ("Lock file prereg_v1.lock.json freezes a different plan", " — plan not frozen"),
+    }  # fmt: skip
+    for status, (text, suffix) in cases.items():
+        lock = (
+            _lock(status, lock_sha256="99998888" + "0" * 56) if status == "hash_mismatch" else _lock(status)
+        )
+        out = build_tables(_with(bundle, {"plan_lock": lock}), reported=REP)
+        for ext in (False, True):
+            t1 = out["T1"].frame(ext)
+            vals = dict(zip(t1["Component"], t1["Configuration"], strict=True))
+            assert vals["Pre-registration"].startswith(text), (status, vals["Pre-registration"])
+        assert dict(zip(out["T1"].extended["Component"], out["T1"].extended["Configuration"], strict=True))[
+            "Plan lock file"
+        ].endswith("prereg_v1.lock.json")
+        for tid, spec in out.items():
+            for ext in (False, True):
+                prov = [n for n in spec.notes(ext) if PLAN.plan_hash() in n]
+                assert len(prov) == 1, (tid, ext)
+                assert (" — plan not frozen" in prov[0]) == bool(suffix), (status, tid, prov[0])
+                if not tid.endswith("_reported"):
+                    assert prov[0].startswith(
+                        f"Analysis plan prereg_v1 (plan hash {PLAN.plan_hash()}){suffix};"
+                    )
+    # a bundle written before the check claims neither "frozen" nor "not frozen"
+    old = build_tables(bundle, reported=NO_REPORTED)
+    prov = next(n for n in old["T3"].footnotes if PLAN.plan_hash() in n)
+    assert " — plan lock not checked" in prov and "not frozen" not in prov
+
+
+def test_stale_scores_note_leads_every_table(bundle, specs):
+    assert not [n for n in _all_notes(specs) if n.startswith("STALE SCORES")]
+    stale = [{"extractor": "v2", "ext_hash": "000011112222", "current_hash": "333344445555", "n": 1234}]
+    out = build_tables(_with(bundle, {"stale_scores": stale}), reported=REP)
+    assert set(out) == set(TABLE_ORDER)
+    for tid, spec in out.items():
+        for ext in (False, True):
+            first = spec.notes(ext)[0]
+            assert first.startswith(
+                "STALE SCORES: computed with extractor hashes v2@000011112222 (1,234 score rows) that differ "
+                "from the current v2@333344445555"
+            ), (tid, ext)
+            assert ("not to the transcribed numbers" in first) == tid.endswith("_reported")
+            assert spec.notes(ext)[-1].startswith(SYNTHETIC_NOTE)  # the trailer still ends the list
+    assert "STALE SCORES" in render_markdown(out["T3"])

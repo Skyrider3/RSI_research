@@ -47,6 +47,8 @@ def test_help_lists_every_command(capsys):
         assert name in out
     rc, out, _ = run(capsys, "run", "--help")
     assert rc == EXIT_OK and "--max-minutes" in out and "--allow-engine-change" in out
+    rc, out, _ = run(capsys, "analyze", "--help")
+    assert rc == EXIT_OK and "--allow-stale-scores" in out
 
 
 def test_no_command_and_bad_usage(capsys):
@@ -344,6 +346,37 @@ def test_analyze_and_audit_commands(smoke_run, capsys):
     assert f"tables: {run_dir / 'exports' / 'tables' / 'all_tables.md'}" in out
     rc, out, _ = run(capsys, "audit", "--run-dir", run_dir, "-q")
     assert rc == EXIT_OK and "audit" in out
+
+
+def test_analyze_refuses_stale_scores_and_the_suggested_command_fixes_them(smoke_run, capsys, tmp_path):
+    import sqlite3
+
+    run_dir = tmp_path / "stale"
+    shutil.copytree(smoke_run[1], run_dir)
+    con = sqlite3.connect(run_dir / "store.sqlite")
+    try:
+        con.execute("UPDATE scores SET ext_hash = 'feedfacecafe' WHERE extractor = 'v1'")
+        con.commit()
+    finally:
+        con.close()
+    rc, out, err = run(capsys, "analyze", "--run-dir", run_dir, "--B", "20", "-q")
+    assert rc == EXIT_ERROR and out == "" and err.count("\n") == 1 and "Traceback" not in err
+    cmd = f"driftlab run -c {run_dir / 'config.yaml'} --run-dir {run_dir} --stages score"
+    assert "stale scores" in err and cmd in err and "--allow-stale-scores" in err
+
+    rc, out, _ = run(capsys, "analyze", "--run-dir", run_dir, "--B", "20", "--allow-stale-scores", "-q")
+    assert rc == EXIT_OK and "STALE SCORES (analysed with --allow-stale-scores): v1@feedfacecafe" in out
+    t3 = (run_dir / "exports" / "tables" / "T3.md").read_text(encoding="utf-8")
+    assert "1. STALE SCORES: computed with extractor hashes v1@feedfacecafe" in t3
+
+    rc, out, _ = run(
+        capsys, "run", "-c", run_dir / "config.yaml", "--run-dir", run_dir, "--stages", "score", "-q"
+    )
+    assert rc == EXIT_OK and "executed 0" in out
+    rc, out, _ = run(capsys, "analyze", "--run-dir", run_dir, "--B", "20", "-q")
+    assert rc == EXIT_OK and "STALE" not in out
+    assert "STALE" not in (run_dir / "exports" / "tables" / "T3.md").read_text(encoding="utf-8")
+    assert "pre-registration: " in out  # status depends on whether the repo plan has been frozen
 
 
 def test_budget_exhausted_exit_code(capsys, tmp_path):
