@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import driftlab
 from driftlab.config import REPO_ROOT, ExperimentConfig, load_plan
@@ -60,13 +61,54 @@ def _run(cmd: list[str], cwd: Path | None = None) -> str | None:
 
 
 def git_info(repo: Path = REPO_ROOT) -> dict[str, Any]:
-    """Commit, branch and dirty flag of the checkout (``None`` values when git or the repo is absent)."""
+    """Commit, branch and dirty flag of the checkout (``None`` values when git or the repo is absent).
+
+    ``repo`` must be the top level of the work tree: a non-editable install lives in site-packages, which may
+    sit inside some unrelated repository whose commit must not be recorded as driftlab's.
+    """
+    none = {"commit": None, "branch": None, "dirty": None}
+    top = _run(["git", "rev-parse", "--show-toplevel"], repo)
+    if top is None or Path(top).resolve() != Path(repo).resolve():
+        return none
     commit = _run(["git", "rev-parse", "HEAD"], repo)
     if commit is None:
-        return {"commit": None, "branch": None, "dirty": None}
+        return none
     branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo)
     status = _run(["git", "status", "--porcelain", "--untracked-files=no"], repo)
     return {"commit": commit, "branch": branch, "dirty": None if status is None else bool(status)}
+
+
+def _strip_credentials(url: str | None) -> str | None:
+    if not url:
+        return url
+    parts = urlsplit(url)
+    if parts.username is None and parts.password is None:
+        return url
+    host = parts.hostname or ""
+    host = f"[{host}]" if ":" in host else host  # IPv6 literal
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+def install_info(dist: str = "driftlab") -> dict[str, Any]:
+    """How the package was installed (PEP 610 ``direct_url.json``): editable flag, source URL (credentials
+    stripped) and VCS commit. Records the code version when there is no git checkout, e.g. on Colab after
+    ``pip install git+...@<commit>``."""
+    out: dict[str, Any] = {"editable": None, "url": None, "vcs_commit": None}
+    try:
+        raw = metadata.distribution(dist).read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return out
+    if not raw:  # installed from an index / wheel: no direct URL recorded
+        return out
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    out["editable"] = bool((info.get("dir_info") or {}).get("editable", False))
+    out["url"] = _strip_credentials(info.get("url"))
+    out["vcs_commit"] = (info.get("vcs_info") or {}).get("commit_id")
+    return out
 
 
 def package_versions(names: tuple[str, ...] = PACKAGES) -> dict[str, str | None]:
@@ -117,7 +159,7 @@ def _json_safe(obj: Any) -> Any:
 def _extractor_tags() -> dict[str, Any]:
     try:
         from driftlab.extraction import extractor_tags
-    except ImportError as e:  # module under construction / broken install
+    except Exception as e:  # module under construction / broken install: record, never fail provenance
         return {"tags": None, "error": repr(e)}
     try:
         return {"tags": dict(extractor_tags()), "error": None}
@@ -171,6 +213,7 @@ def collect_provenance(
     prov: dict[str, Any] = {
         "driftlab_version": driftlab.__version__,
         "git": git_info(),
+        "install": install_info(),
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -222,6 +265,7 @@ __all__ = [
     "collect_provenance",
     "git_info",
     "gpu_info",
+    "install_info",
     "package_versions",
     "provenance_digest",
 ]

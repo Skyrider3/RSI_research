@@ -63,6 +63,23 @@ def test_dev_error_rejects_eval_split() -> None:
         DevError(1, "q", "r", "5", split="validation")
 
 
+def test_from_item_carries_split_so_eval_items_are_refused(cfg: ExperimentConfig) -> None:
+    """Regression: DevError(idx, question, response, gold) defaults to split='train', so a caller that builds
+    errors from EVAL items without passing the split would slip test questions into the meta-prompt.
+    DevError.from_item propagates the item's split and the guard fires."""
+    dev_item, eval_item = load_dev(cfg)[0], load_eval(cfg)[0]
+    e = DevError.from_item(dev_item, "resp")
+    assert (e.idx, e.question, e.gold, e.split, e.response) == (
+        dev_item.idx,
+        dev_item.question,
+        dev_item.gold,
+        "train",
+        "resp",
+    )
+    with pytest.raises(LeakageError):
+        DevError.from_item(eval_item, "resp")
+
+
 def test_tampered_dev_error_is_refused() -> None:
     e = DevError(1, "q", "r", "5")
     object.__setattr__(e, "split", "test")
@@ -284,6 +301,18 @@ def test_fallback_is_deterministic_and_appends_one_sentence() -> None:
     assert head == INITIAL and added in edits
     outs = {fallback_candidate(INITIAL, s, r, [INITIAL]) for s in range(3) for r in range(1, 12)}
     assert len(outs) > 1  # the seeded choice varies
+
+
+def test_fallback_choice_matches_spec_formula() -> None:
+    """The fallback sentence is Random(rng_seed(seed, "fallback", round)).choice over the eligible edits in
+    file order (pinned: a resumed run must re-derive the same fallback)."""
+    import random
+
+    edits = load_fallback_edits()
+    for seed, round_ in [(0, 1), (1, 4), (2, 11)]:
+        options = [f"{INITIAL}\n{e}" for e in edits]
+        want = random.Random(keys.rng_seed(seed, "fallback", round_)).choice(options)
+        assert fallback_candidate(INITIAL, seed, round_, [INITIAL]) == want
 
 
 def test_fallback_skips_present_sentences_and_duplicates() -> None:

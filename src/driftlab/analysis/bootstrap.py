@@ -57,6 +57,16 @@ def _point(stat: Stat, mat: np.ndarray) -> float:
     return float(np.mean([float(stat(row)) for row in mat]))
 
 
+def _check_indices(idx: np.ndarray, n_items: int) -> np.ndarray:
+    """Validate a (B, n_items) replicate index matrix: a resample must have exactly ``n_items`` valid items."""
+    idx = np.asarray(idx)
+    if idx.ndim != 2 or idx.shape[1] != n_items:
+        raise ValueError(f"indices of shape {idx.shape} do not fit {n_items} items (expected (B, {n_items}))")
+    if idx.size and (idx.min() < 0 or idx.max() >= n_items):
+        raise ValueError(f"indices must lie in [0, {n_items}); got [{idx.min()}, {idx.max()}]")
+    return idx
+
+
 def bootstrap_replicates(
     arrays: Sequence[np.ndarray],
     B: int,
@@ -73,9 +83,8 @@ def bootstrap_replicates(
     mat = _stack(arrays)
     if mat.shape[0] == 0 or mat.shape[1] == 0:
         return np.zeros(0, dtype=float)
-    idx = bootstrap_indices(mat.shape[1], B, seed) if indices is None else np.asarray(indices)
-    if idx.ndim != 2 or (idx.size and idx.max() >= mat.shape[1]):
-        raise ValueError(f"indices of shape {idx.shape} do not fit {mat.shape[1]} items")
+    n_items = mat.shape[1]
+    idx = bootstrap_indices(n_items, B, seed) if indices is None else _check_indices(indices, n_items)
     if idx.shape[0] == 0:
         return np.zeros(0, dtype=float)
     if stat is np.mean:
@@ -139,7 +148,7 @@ def bootstrap_diff_ci(
         raise ValueError(f"groups cover different item counts: {ma.shape[1]} vs {mb.shape[1]}")
     pa = float(ma.mean()) if stat is np.mean else _point(stat, ma)
     pb = float(mb.mean()) if stat is np.mean else _point(stat, mb)
-    idx = bootstrap_indices(ma.shape[1], B, seed) if indices is None else np.asarray(indices)
+    idx = bootstrap_indices(ma.shape[1], B, seed) if indices is None else _check_indices(indices, ma.shape[1])
     ra = bootstrap_replicates(list(ma), B, seed, stat, indices=idx)
     rb = bootstrap_replicates(list(mb), B, seed, stat, indices=idx)
     lo, hi = percentile_interval(ra - rb, alpha)

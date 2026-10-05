@@ -22,7 +22,7 @@ import yaml
 from driftlab import keys
 from driftlab.backends.base import GenRequest
 from driftlab.config import ProposerSection
-from driftlab.data import DEV_SPLIT, LeakageError
+from driftlab.data import DEV_SPLIT, Item, LeakageError
 from driftlab.environments import Decoding
 from driftlab.prompting import PROPOSER_SYSTEM, fill, load_prompt_file
 
@@ -68,6 +68,12 @@ class DevError:
                 f"DevError must come from the {DEV_SPLIT!r} split; got split={self.split!r} (item {self.idx}). "
                 "The eval split must never reach the proposer."
             )
+
+    @classmethod
+    def from_item(cls, item: Item, response: str) -> DevError:
+        """Build from a dataset :class:`~driftlab.data.Item`, carrying its split so that the leakage guard
+        fires for eval items (the ``split`` default would otherwise let a test question through silently)."""
+        return cls(idx=item.idx, question=item.question, response=response, gold=item.gold, split=item.split)
 
 
 def _check_dev_errors(errors: Sequence[DevError]) -> None:

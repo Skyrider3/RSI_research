@@ -49,6 +49,8 @@ RenderMode = Literal["auto", "chat_template", "messages_json"]
 RETRY_STATUS: frozenset[int] = frozenset({408, 409, 425, 429})
 VLLM_TOP_K_DISABLED = -1
 VLLM_MIN_P_DISABLED = 0.0
+# Bump whenever the request body semantics change (it is in engine_info, hence in every gen_key).
+PAYLOAD_VERSION = "v2"  # v2: explicit min_p; add_special_tokens=false for chat_template prompts
 _T = TypeVar("_T")
 
 
@@ -176,6 +178,7 @@ class OpenAICompatBackend(Backend):
             "served_model": self.served_model,
             "render": self.render_mode,
             "endpoint": self.endpoint,
+            "payload": PAYLOAD_VERSION,
             "vllm_extras": self.vllm_extras,
             "extra_body": json.dumps(self.extra_body, sort_keys=True, default=str),
         }

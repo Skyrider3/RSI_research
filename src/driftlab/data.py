@@ -341,7 +341,10 @@ def answer_key(cfg: ExperimentConfig) -> dict[str, str]:
 def snapshot_info(cfg: ExperimentConfig) -> dict[str, Any]:
     """Dataset pins and snapshot file hashes for provenance (does not raise on a bad snapshot)."""
     directory = snapshot_dir(cfg)
-    manifest = _read_manifest(directory) or {}
+    try:
+        manifest = _read_manifest(directory) or {}
+    except DataIntegrityError:  # unreadable manifest: reported as absent / not matching
+        manifest = {}
     recorded = manifest.get("files") or {}
     files: dict[str, dict[str, Any]] = {}
     for split in (cfg.data.dev.split, cfg.data.eval.split):
@@ -358,6 +361,14 @@ def snapshot_info(cfg: ExperimentConfig) -> dict[str, Any]:
             ("revision", cfg.data.revision),
         )
     )
+
+    def _source(sec: Any) -> str:
+        """Where ``load_items`` reads this split from: the snapshot, or the Hub parquet if it is too small."""
+        name = snapshot_filename(sec.split)
+        held = (recorded.get(name) or {}).get("n")
+        present = bool(manifest) and files.get(name, {}).get("sha256") is not None
+        return "snapshot" if present and held is not None and sec.n <= int(held) else "hub"
+
     return {
         "dataset": cfg.data.dataset,
         "config": cfg.data.config,
@@ -368,8 +379,8 @@ def snapshot_info(cfg: ExperimentConfig) -> dict[str, Any]:
         "pins_match": pins_ok,
         "files": files,
         "source_files": {k: (v or {}).get("sha256") for k, v in (manifest.get("source_files") or {}).items()},
-        "dev": {"split": cfg.data.dev.split, "n": cfg.data.dev.n},
-        "eval": {"split": cfg.data.eval.split, "n": cfg.data.eval.n},
+        "dev": {"split": cfg.data.dev.split, "n": cfg.data.dev.n, "source": _source(cfg.data.dev)},
+        "eval": {"split": cfg.data.eval.split, "n": cfg.data.eval.n, "source": _source(cfg.data.eval)},
     }
 
 

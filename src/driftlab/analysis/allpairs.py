@@ -15,7 +15,10 @@ promotion rule; ground truth uses ``cube.gt_acc`` under c at round j. ``inflatio
 ``infl_extract + infl_generation`` so that the decomposition is exact in floating point; it equals
 ``(w_stored - w_rerun) / n`` up to one ulp. Pairs whose inflation is zero *by construction* (the rerun is a
 cache hit of the stored generation and the extractor did not change) are flagged ``by_construction`` and
-must never be reported as a measured zero.
+must never be reported as a measured zero; ``gen_by_construction`` flags the same cache hit for the
+generation part alone (e.g. E3 without physical reruns). ``gt_coupled`` marks pairs whose GT reuses the
+decision cells and items (greedy, or ``same_draw``): there ``fa_cur_fresh`` and ``fa_ref_rerun`` cannot be
+True (any rule needing wins > losses), which is the documented greedy caveat, not a finding.
 """
 
 from __future__ import annotations
@@ -64,6 +67,8 @@ PAIR_COLUMNS: tuple[str, ...] = (
     "env_changed",
     "decoding",
     "extractor",
+    "gen_by_construction",
+    "gt_coupled",
 )
 
 _FAR_REFS: tuple[str, ...] = ("stored", "rescored", "rerun", "fresh")
@@ -105,6 +110,9 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     "by_construction_frac",
     "all_by_construction",
     "trunc_rerun",
+    "gen_by_construction_frac",
+    "all_gen_by_construction",
+    "gt_coupled_frac",
 )
 
 T4_LABELS: dict[str, str] = {
@@ -136,6 +144,7 @@ T4_COLUMNS: tuple[str, ...] = (
     "rerun_win_seed_sd",
     "infl_seed_mean",
     "infl_seed_sd",
+    "gen_by_construction",
 )
 
 T7_COLUMNS: tuple[str, ...] = (
@@ -158,6 +167,7 @@ T7_COLUMNS: tuple[str, ...] = (
     "n_seeds",
     "far_cur_stored_lo",
     "far_cur_stored_hi",
+    "gt_coupled",
 )
 
 PairKey = tuple[int, str, int, int]
@@ -250,6 +260,25 @@ def _same_gen_frac(cube: Cube, a: tuple, b: tuple, items: np.ndarray | None) -> 
     return float((ga[ok] == gb[ok]).mean())
 
 
+def _same_generation(cube: Cube, stored_cell: tuple, rerun_cell: tuple, sgf: float) -> bool:
+    """True when the rerun cell is (on every compared item) the stored generation itself.
+
+    The identical cell (age 0 under the storage decoding) is always the same generation. Otherwise the gen-row
+    fraction decides; when gen rows are unavailable (NaN fraction) fall back to the matrix semantics of
+    section 4: a non-physical cell of the same decoding is a cache hit of the slot's creation generation,
+    so the pair is flagged rather than reported as a measured zero.
+    """
+    if stored_cell == rerun_cell:
+        return True
+    if np.isfinite(sgf):
+        return bool(sgf == 1.0)
+    _, d_st, ref, rd_i = stored_cell
+    d_c = rerun_cell[1]
+    if d_st != d_c or cube.is_physical(*rerun_cell):
+        return False
+    return rd_i == (DRAW_ROUND, ref) or not cube.is_physical(*stored_cell)
+
+
 def _item_sets(n_items: int, gt_mode: str) -> tuple[np.ndarray, np.ndarray | None, str]:
     """(decision items, GT items or None for all, mode passed to cube.gt_acc)."""
     if gt_mode == "split_half":
@@ -313,6 +342,10 @@ def _pair(
     stored_cell = (seed, d_st, ref, rd_i)
     rerun_cell = (seed, d_c, ref, rd_j)
     sgf = _same_gen_frac(cube, stored_cell, rerun_cell, dec_items if split else None)
+    same_gen = _same_generation(cube, stored_cell, rerun_cell, sgf)
+    # GT read from the very cells (and items) the decisions used: then w - l = n * (gt_cand - gt_x) for the
+    # fresh (and same-cell rerun) reference, so fa_cur_fresh / fa_ref_rerun are False by construction.
+    gt_coupled = (not split) and (cube.is_greedy(d_c) or gt_mode == "same_draw")
 
     row: dict = {
         "seed": int(seed),
@@ -342,13 +375,15 @@ def _pair(
         row[f"fa_cur_{r}"] = bool(dec[r] and worse_cur)
     for r in REFS:
         row[f"fa_ref_{r}"] = bool(dec[r] and worse_ref)
-    row["by_construction"] = bool(sgf == 1.0 and x_st == x_c)
+    row["by_construction"] = bool(same_gen and x_st == x_c)
     row["same_gen_frac"] = sgf
     row["physical_rerun"] = cube.is_physical(*rerun_cell)
     row["trunc_rerun"] = cube.trunc_rate(*rerun_cell)
     row["env_changed"] = str(env) != str(storage_env)
     row["decoding"] = d_c
     row["extractor"] = x_c
+    row["gen_by_construction"] = bool(same_gen)  # infl_generation == 0 by construction (cache hit)
+    row["gt_coupled"] = bool(gt_coupled)
 
     diff = (cand & ~vecs["stored"]).astype(np.int8) - (cand & ~vecs["rerun"]).astype(np.int8)
     return row, diff
@@ -356,7 +391,7 @@ def _pair(
 
 def all_pairs(
     cube: Cube,
-    trajs: Mapping[int, Trajectory],
+    trajs: Mapping[int, Trajectory] | Sequence[Trajectory],
     envs: Mapping[str, object] | None,
     plan,
     env_ids: Sequence[str] | None = None,
@@ -368,13 +403,17 @@ def all_pairs(
     ``promotion_rule`` and ``gt.mode``). ``envs`` maps env ids to environments (see :func:`env_axes`);
     ``env_ids`` restricts the current environments (default: all of ``envs``); ``ages`` keeps only pairs with
     ``j - i`` in ``ages``. Pairs that need a cell the cube does not have are skipped and listed in
-    ``PairResult.skipped``; this function never raises for missing cells.
+    ``PairResult.skipped``; this function never raises for missing cells. ``trajs`` may also be a sequence of
+    trajectories (keyed by ``Trajectory.seed``).
     """
+    if not isinstance(trajs, Mapping):
+        trajs = {int(t.seed): t for t in trajs}
+    env_ids, ages = _as_list(env_ids), _as_list(ages)
     axes = env_axes(envs)
     st = str(plan.storage_env)
     if st not in axes:
         raise ValueError(f"storage env {st!r} is not among the environments {sorted(axes)}")
-    targets = [str(e) for e in (env_ids if env_ids is not None else list(axes))]
+    targets = list(dict.fromkeys(str(e) for e in (env_ids if env_ids is not None else list(axes))))
     unknown = [e for e in targets if e not in axes]
     if unknown:
         raise ValueError(f"unknown environment ids {unknown}; known: {sorted(axes)}")
@@ -419,16 +458,35 @@ def all_pairs(
     return PairResult(df=df, item_diffs=diffs, item_index=dec_items, skipped=skipped, gt_index=gt_items)
 
 
+_BOOL_PAIR_COLUMNS = (
+    "flip",
+    "by_construction",
+    "physical_rerun",
+    "env_changed",
+    "gen_by_construction",
+    "gt_coupled",
+)
+
+
 def _empty_pairs() -> pd.DataFrame:
     df = pd.DataFrame({c: pd.Series(dtype=float) for c in PAIR_COLUMNS})
     for c in ("seed", "j", "i", "age", "ref_slot", "cur_slot", "n"):
         df[c] = df[c].astype(np.int64)
     for c in PAIR_COLUMNS:
-        if c.startswith(("dec_", "fa_")) or c in ("flip", "by_construction", "physical_rerun", "env_changed"):
+        if c.startswith(("dec_", "fa_")) or c in _BOOL_PAIR_COLUMNS:
             df[c] = df[c].astype(bool)
     for c in ("env", "decoding", "extractor"):
         df[c] = df[c].astype(str)
     return df
+
+
+def _as_list(v: object) -> list | None:
+    """``None`` -> ``None``; a bare string or scalar -> ``[v]`` (never iterate a string's characters)."""
+    if v is None:
+        return None
+    if isinstance(v, (str, bytes, int, np.integer)):
+        return [v]
+    return list(v)
 
 
 def filter_pairs(
@@ -439,6 +497,7 @@ def filter_pairs(
     seeds: Sequence[int] | None = None,
 ) -> PairResult:
     """Subset of a PairResult (rows and their item diffs), e.g. the envs an ablation schedule visits."""
+    env_ids, ages, seeds = _as_list(env_ids), _as_list(ages), _as_list(seeds)
     m = pd.Series(True, index=pr.df.index)
     if env_ids is not None:
         m &= pr.df["env"].isin([str(e) for e in env_ids])
@@ -467,6 +526,20 @@ def _row_keys(df: pd.DataFrame) -> list[PairKey]:
 # --------------------------------------------------------------------------- summaries
 
 
+def _wilson(k: int, n: int) -> tuple[float, float, float]:
+    """``metrics.wilson`` with exact bounds at the edges (k == 0 -> lo = 0, k == n -> hi = 1)."""
+    p, lo, hi = wilson(k, n)
+    if n > 0 and k <= 0:
+        lo = 0.0
+    if n > 0 and k >= n:
+        hi = 1.0
+    return p, lo, hi
+
+
+def _frac(g: pd.DataFrame, col: str) -> float:
+    return float(g[col].astype(bool).mean()) if len(g) and col in g.columns else float("nan")
+
+
 def _far(g: pd.DataFrame, ref: str) -> tuple[int, int, tuple[float, float, float], float, float]:
     n_acc = int(g[f"dec_{ref}"].sum())
     n_fa = int(g[f"fa_cur_{ref}"].sum())
@@ -474,7 +547,7 @@ def _far(g: pd.DataFrame, ref: str) -> tuple[int, int, tuple[float, float, float
         _rate(int(gs[f"fa_cur_{ref}"].sum()), int(gs[f"dec_{ref}"].sum())) for _, gs in g.groupby("seed")
     ]
     m, sd, _ = mean_sd(per_seed)
-    return n_acc, n_fa, wilson(n_fa, n_acc), m, sd
+    return n_acc, n_fa, _wilson(n_fa, n_acc), m, sd
 
 
 def _seed_mean_sd(g: pd.DataFrame, col: str) -> tuple[float, float]:
@@ -510,7 +583,24 @@ def _summarize_group(
     out["by_construction_frac"] = float(g["by_construction"].mean()) if len(g) else float("nan")
     out["all_by_construction"] = bool(len(g) > 0 and g["by_construction"].all())
     out["trunc_rerun"] = float(g["trunc_rerun"].mean()) if len(g) else float("nan")
+    out["gen_by_construction_frac"] = _frac(g, "gen_by_construction")
+    out["all_gen_by_construction"] = bool(out["gen_by_construction_frac"] == 1.0)
+    out["gt_coupled_frac"] = _frac(g, "gt_coupled")
     return out
+
+
+def _check_item_diffs(pr: PairResult) -> int:
+    """Number of decision items; every row must have an item diff of that length (or no row has one)."""
+    keys = _row_keys(pr.df)
+    have = [k in pr.item_diffs for k in keys]
+    if any(have) and not all(have):
+        missing = [k for k, h in zip(keys, have, strict=True) if not h][:3]
+        raise ValueError(f"item_diffs missing for {have.count(False)} of {len(keys)} rows, e.g. {missing}")
+    n_dec = len(pr.item_index)
+    bad = {len(pr.item_diffs[k]) for k, h in zip(keys, have, strict=True) if h} - {n_dec}
+    if bad:
+        raise ValueError(f"item_diffs have lengths {sorted(bad)} but item_index has {n_dec} items")
+    return n_dec
 
 
 def summarize_pairs(
@@ -526,15 +616,19 @@ def summarize_pairs(
     replicate index vectors (``bootstrap_indices(n, B, seed)``), so groups are coupled like the H1 contrasts.
     FAR = sum(fa_cur) / sum(dec) with a Wilson 95% CI (NaN with no accepts); ``*_seed_mean/_seed_sd`` are the
     mean and sd over seeds of per-seed values (NaN-aware). ``by=()`` summarizes all rows as one group.
+    ``gen_by_construction_frac`` is the share of pairs whose generation part is zero by construction (cache
+    hit) and ``gt_coupled_frac`` the share whose GT reuses the decision cells (FAR_cur(fresh) and
+    FAR_ref(rerun) are then 0 by construction). Raises ``ValueError`` when ``item_diffs`` do not match the
+    rows or ``item_index`` (a CI over other items than the point estimate would be silently wrong).
     """
-    by = [str(b) for b in by]
+    by = [str(b) for b in (_as_list(by) or [])]
     missing = [b for b in by if b not in pr.df.columns]
     if missing:
         raise ValueError(f"cannot group by unknown columns {missing}")
     cols = [*by, *SUMMARY_COLUMNS]
     if pr.df.empty:
         return pd.DataFrame({c: pd.Series(dtype=float) for c in cols})
-    n_dec = len(pr.item_index)
+    n_dec = _check_item_diffs(pr)
     indices = bootstrap_indices(n_dec, B, seed) if n_dec and B > 0 else None
     rows: list[dict] = []
     if not by:
@@ -568,10 +662,23 @@ def _get(row: pd.Series | None, col: str, default: object = float("nan")) -> obj
     return row[col]
 
 
+def _flag(row: pd.Series | None, col: str) -> bool:
+    """A boolean summary flag; missing or NaN counts as False (``bool(nan)`` would be True)."""
+    v = _get(row, col, False)
+    return False if pd.isna(v) else bool(v)
+
+
+def _all(row: pd.Series | None, frac_col: str) -> bool:
+    v = _get(row, frac_col)
+    return False if pd.isna(v) else bool(float(v) == 1.0)
+
+
 def table7_frame(summary: pd.DataFrame, plan) -> pd.DataFrame:
     """T7: reference age (``plan.t7.ages``) x {unchanged, changed} env; long form, age-major.
 
     ``by_construction`` is True when every pair of the cell is identical by construction (render as "‡").
+    ``gt_coupled`` is True when every pair's GT reuses the decision cells (greedy, or ``same_draw``): then
+    ``far_cur_fresh`` is 0 by construction and must carry the greedy-coupling caveat, not read as a finding.
     Cells without pairs keep their row with ``n_pairs = 0`` and NaN metrics.
     """
     t7 = plan.t7
@@ -597,11 +704,12 @@ def table7_frame(summary: pd.DataFrame, plan) -> pd.DataFrame:
                     "far_cur_fresh": _get(r, "far_cur_fresh"),
                     "flip_rate": _get(r, "flip_rate"),
                     "n_accept_stored": int(_get(r, "n_accept_stored", 0)),
-                    "by_construction": bool(_get(r, "all_by_construction", False)),
+                    "by_construction": _flag(r, "all_by_construction"),
                     "by_construction_frac": _get(r, "by_construction_frac"),
                     "n_seeds": int(_get(r, "n_seeds", 0)),
                     "far_cur_stored_lo": _get(r, "far_cur_stored_lo"),
                     "far_cur_stored_hi": _get(r, "far_cur_stored_hi"),
+                    "gt_coupled": _all(r, "gt_coupled_frac"),
                 }
             )
     return pd.DataFrame(rows, columns=list(T7_COLUMNS))
@@ -613,7 +721,11 @@ def table4_frame(
     env_ids: Sequence[str] = ("E1", "E2", "E3", "E4"),
     labels: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
-    """T4: one row per environment at reference age ``plan.t4.age`` (labels from :data:`T4_LABELS`)."""
+    """T4: one row per environment at reference age ``plan.t4.age`` (labels from :data:`T4_LABELS`).
+
+    ``gen_by_construction`` is True when every pair's generation part is 0 by construction (cache-hit rerun,
+    e.g. E3 without physical greedy reruns): render that part as "‡", not as a measured 0.
+    """
     labels = dict(T4_LABELS if labels is None else labels)
     age = int(plan.t4.age)
     rows = []
@@ -634,7 +746,7 @@ def table4_frame(
                 "infl_extract": _get(r, "infl_extract"),
                 "infl_generation": _get(r, "infl_generation"),
                 "flip_rate": _get(r, "flip_rate"),
-                "by_construction": bool(_get(r, "all_by_construction", False)),
+                "by_construction": _flag(r, "all_by_construction"),
                 "by_construction_frac": _get(r, "by_construction_frac"),
                 "stored_win_seed_mean": _get(r, "win_stored_seed_mean"),
                 "stored_win_seed_sd": _get(r, "win_stored_seed_sd"),
@@ -642,6 +754,7 @@ def table4_frame(
                 "rerun_win_seed_sd": _get(r, "win_rerun_seed_sd"),
                 "infl_seed_mean": _get(r, "infl_seed_mean"),
                 "infl_seed_sd": _get(r, "infl_seed_sd"),
+                "gen_by_construction": _all(r, "gen_by_construction_frac"),
             }
         )
     return pd.DataFrame(rows, columns=list(T4_COLUMNS))

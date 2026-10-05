@@ -6,11 +6,21 @@ import hashlib
 import json
 import subprocess
 import sys
+import types
+from pathlib import Path
 
 import pytest
 
+from driftlab import provenance
 from driftlab.config import REPO_ROOT, ExperimentConfig, load_config
-from driftlab.provenance import PACKAGES, collect_provenance, package_versions, provenance_digest
+from driftlab.provenance import (
+    PACKAGES,
+    collect_provenance,
+    git_info,
+    install_info,
+    package_versions,
+    provenance_digest,
+)
 
 REQUIRED = {
     "driftlab_version",
@@ -38,6 +48,7 @@ def test_keys_present(cfg: ExperimentConfig) -> None:
     prov = collect_provenance(cfg)
     assert set(prov) >= REQUIRED
     assert set(prov["git"]) == {"commit", "branch", "dirty"}
+    assert set(prov["install"]) == {"editable", "url", "vcs_commit"}
     for name in ("numpy", "pandas", "pydantic", "torch", "transformers", "vllm", "accelerate", "streamlit"):
         assert name in prov["packages"]
     assert prov["packages"]["numpy"] is not None
@@ -130,6 +141,46 @@ def test_backend_and_extra(cfg: ExperimentConfig) -> None:
     plain = collect_provenance(cfg)
     assert plain["backend"]["engine_info"] is None and "extra" not in plain
     assert provenance_digest(prov) != provenance_digest(plain)
+
+
+def test_git_info_requires_repo_top_level(tmp_path: Path) -> None:
+    """Regression: a non-editable install lives in site-packages; git run there may find an unrelated
+    enclosing repository. Only the work-tree top level counts."""
+    assert git_info(REPO_ROOT / "src")["commit"] is None
+    assert git_info(tmp_path) == {"commit": None, "branch": None, "dirty": None}
+    top = git_info(REPO_ROOT)
+    if top["commit"] is not None:  # git available in this environment
+        assert len(top["commit"]) == 40 and isinstance(top["dirty"], bool)
+
+
+def test_install_info_and_credential_stripping() -> None:
+    info = install_info()
+    assert set(info) == {"editable", "url", "vcs_commit"}
+    assert install_info("definitely-not-a-real-package-xyz") == {
+        "editable": None,
+        "url": None,
+        "vcs_commit": None,
+    }
+    strip = provenance._strip_credentials
+    assert strip("git+https://user:tok@github.com/o/r.git") == "git+https://github.com/o/r.git"
+    assert strip("https://tok@example.org:8443/x") == "https://example.org:8443/x"
+    assert strip("file:///home/user/repo") == "file:///home/user/repo"
+    assert strip(None) is None
+
+
+def test_extractor_failure_never_breaks_provenance(
+    cfg: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Broken(types.ModuleType):
+        def __getattr__(self, name: str) -> object:
+            raise RuntimeError("frozen extractor hash mismatch")
+
+    monkeypatch.setitem(sys.modules, "driftlab.extraction", Broken("driftlab.extraction"))
+    ext = collect_provenance(cfg)["extractors"]
+    assert ext["tags"] is None and "frozen extractor hash mismatch" in ext["error"]
+    monkeypatch.setitem(sys.modules, "driftlab.extraction", None)  # import itself fails
+    ext = collect_provenance(cfg)["extractors"]
+    assert ext["tags"] is None and ext["error"]
 
 
 def test_packages_list_covers_spec() -> None:

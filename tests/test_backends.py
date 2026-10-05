@@ -477,6 +477,22 @@ def test_vllm_injected_llm_is_not_vouched_for(fake_vllm):
     assert fake_vllm["params"][0].max_tokens == 640
 
 
+def test_vllm_engine_env_overrides_change_fingerprint(fake_vllm, monkeypatch):
+    from driftlab.keys import engine_fingerprint
+
+    for var in vllm_backend.ENGINE_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    b = vllm_backend.VLLMBackend("m", "rev")
+    info = b.engine_info()
+    assert info["env"] == {"VLLM_USE_V1": None, "VLLM_ATTENTION_BACKEND": None}
+    assert "transformers" in info and "tokenizers" in info
+    monkeypatch.setenv("VLLM_USE_V1", "0")  # V0 engine forced on a resumed session: a different engine
+    assert b.engine_info() == info  # captured when the engine was built
+    changed = vllm_backend.VLLMBackend("m", "rev").engine_info()
+    assert changed["env"]["VLLM_USE_V1"] == "0"
+    assert engine_fingerprint(changed) != engine_fingerprint(info)
+
+
 def test_vllm_prefix_caching_flag_passthrough(fake_vllm):
     cfg = _cfg("vllm", vllm={"enable_prefix_caching": True})
     b = backends.make_backend(cfg)
@@ -544,12 +560,17 @@ def test_openai_chat_template_payload(monkeypatch):
     for body in bodies:
         assert body["top_p"] == 1.0 and body["max_tokens"] == 640 and body["n"] == 1
         assert body["top_k"] == -1 and body["repetition_penalty"] == 1.0
+        # vLLM fills every omitted sampling field (min_p too) from the checkpoint's generation_config
+        assert body["min_p"] == 0.0
+        # the rendered template is the exact model input: no extra BOS from /completions
+        assert body["add_special_tokens"] is False
         assert body["stop_token_ids"] == [2, 3]
     assert g["temperature"] == 0.0 and "seed" not in g  # greedy: no seed
     assert s["temperature"] == 0.2 and s["seed"] == 4242
     info = b.engine_info()
     assert info["kind"] == "openai_compat" and info["render"] == "chat_template"
     assert info["base_url"] == "http://server.test/v1" and info["served_model"] == "qwen-served"
+    assert info["payload"] == openai_compat.PAYLOAD_VERSION  # body semantics are fingerprinted
 
 
 def test_openai_messages_json_mode(monkeypatch):
@@ -574,6 +595,8 @@ def test_openai_messages_json_mode(monkeypatch):
     body = json.loads(r.content)
     assert body["messages"][1] == {"role": "user", "content": "q"}
     assert "prompt" not in body and "seed" not in body and "stop_token_ids" not in body
+    assert "add_special_tokens" not in body  # chat endpoint: the server's template decides
+    assert body["min_p"] == 0.0 and body["top_k"] == -1 and body["repetition_penalty"] == 1.0
     assert b.engine_info()["render"] == "messages_json"
 
 
@@ -670,7 +693,25 @@ def test_openai_extras_toggle_and_extra_body():
     b = _oa(lambda r: httpx.Response(200, json=_ok(chat=True)), vllm_extras=False, extra_body={"min_p": 0.0})
     body = b.payload(GenRequest(SYSTEM, "q", T02, seed=1))
     assert "top_k" not in body and "repetition_penalty" not in body
-    assert body["min_p"] == 0.0 and body["seed"] == 1
+    assert body["min_p"] == 0.0 and body["seed"] == 1  # min_p here comes from extra_body only
+    plain = _oa(lambda r: httpx.Response(200, json=_ok(chat=True)), vllm_extras=False)
+    assert not {"top_k", "min_p", "repetition_penalty", "add_special_tokens"} & set(
+        plain.payload(GenRequest(SYSTEM, "q", T02, seed=1))
+    )
+
+
+def test_openai_null_finish_reason_does_not_hide_truncation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        n = body["max_tokens"] if "LONG" in body["messages"][1]["content"] else 3
+        data = _ok("x", finish=None, chat=True)
+        data["usage"]["completion_tokens"] = n
+        return httpx.Response(200, json=data)
+
+    dec = Decoding(id="greedy", temperature=0.0, max_new_tokens=32)
+    res = _oa(handler).generate([GenRequest(SYSTEM, "q LONG", dec), GenRequest(SYSTEM, "q", dec)])
+    assert [r.finish_reason for r in res] == ["length", "stop"]
+    assert res[0].n_completion_tokens == 32
 
 
 def test_openai_requires_base_url_and_factory(monkeypatch):

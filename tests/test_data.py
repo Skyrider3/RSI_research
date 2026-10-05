@@ -67,6 +67,8 @@ def test_snapshot_verifies_and_loads_both_splits() -> None:
     assert info["pins_match"] and info["snapshot_present"]
     assert all(f["ok"] for f in info["files"].values())
     assert info["revision"] == cfg.data.revision
+    assert info["dev"]["source"] == info["eval"]["source"] == "snapshot"
+    assert snapshot_info(_with_n(cfg, dev_n=250))["dev"]["source"] == "hub"
 
 
 def test_tampered_copy_raises(snap_copy: Path) -> None:
@@ -109,6 +111,28 @@ def test_wrong_stored_gold_is_detected(snap_copy: Path) -> None:
     (snap_copy / "snapshot.json").write_text(json.dumps(manifest))
     with pytest.raises(DataIntegrityError, match="gold"):
         load_eval(_cfg(snapshot_dir=str(snap_copy)))
+
+
+def test_corrupt_manifest_raises_but_snapshot_info_tolerates(snap_copy: Path) -> None:
+    (snap_copy / "snapshot.json").write_text("{not json", encoding="utf-8")
+    cfg = _cfg(snapshot_dir=str(snap_copy))
+    with pytest.raises(DataIntegrityError, match="JSON"):
+        load_dev(cfg)
+    info = snapshot_info(cfg)  # provenance must never crash on a bad snapshot
+    assert not info["snapshot_present"] and not info["pins_match"]
+    assert not any(f["ok"] for f in info["files"].values())
+
+
+def test_misconfigured_dev_split_is_refused() -> None:
+    """A config pointing the dev split at the test file can never produce a DevSplit."""
+    cfg = ExperimentConfig()
+    cfg = cfg.model_copy(
+        update={
+            "data": cfg.data.model_copy(update={"dev": cfg.data.dev.model_copy(update={"split": "test"})})
+        }
+    )
+    with pytest.raises(LeakageError):
+        load_dev(cfg)
 
 
 # --------------------------------------------------------------------------- ordering and types

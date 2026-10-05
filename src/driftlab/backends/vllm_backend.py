@@ -113,6 +113,7 @@ class VLLMBackend(Backend):
         self.capability: tuple[int, int] | None = dev["capability"] if dev else None
         self.dtype_name = resolve_dtype_name(dtype, "cuda" if dev else "cpu", self.capability)
         self.generation_config_mode = "vllm"
+        self.engine_env = {k: os.environ.get(k) for k in ENGINE_ENV_VARS}  # as seen when the engine is built
         self.llm_kwargs: dict[str, Any] = {
             "model": model_id,
             "revision": model_revision,
@@ -162,7 +163,7 @@ class VLLMBackend(Backend):
             "torch": _torch_version(),
             "transformers": package_version("transformers"),  # chat template + tokenizer code
             "tokenizers": package_version("tokenizers"),
-            "env": {k: os.environ.get(k) for k in ENGINE_ENV_VARS},
+            "env": dict(self.engine_env),
             "dtype": self._effective_dtype(),
             "gpu_class": self.gpu_class,
             "capability": format_capability(self.capability),

@@ -560,3 +560,176 @@ def test_candidates_frame_rows_and_decisions():
     only_p1 = [r for r in runs if r.policy.name == "P1"]
     df2 = candidates_frame(cube, trajs, plan, ENVS, only_p1)
     pd.testing.assert_frame_equal(df, df2)
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_split_half_requires_both_disjoint_item_sets():
+    """A single explicit half under split_half used to measure GT on ALL items (re-coupling decision and GT)."""
+    cube = random_cube(R=4, N=40, seeds=(0,), tag="split2")
+    t, sched = traj(0, 4), EnvSchedule({0: "E1"})
+    with pytest.raises(ValueError, match="both"):
+        simulate(cube, t, sched, ENVS, "P2", RULE, gt_mode="split_half", items=np.arange(20))
+    with pytest.raises(ValueError, match="both"):
+        simulate(cube, t, sched, ENVS, "P2", RULE, gt_mode="split_half", gt_items=np.arange(20, 40))
+    with pytest.raises(ValueError, match="disjoint"):
+        simulate(
+            cube,
+            t,
+            sched,
+            ENVS,
+            "P2",
+            RULE,
+            gt_mode="split_half",
+            items=np.arange(25),
+            gt_items=np.arange(20, 40),
+        )
+    explicit = simulate(
+        cube,
+        t,
+        sched,
+        ENVS,
+        "P2",
+        RULE,
+        gt_mode="split_half",
+        items=np.arange(20),
+        gt_items=np.arange(20, 40),
+    )
+    implicit = simulate(cube, t, sched, ENVS, "P2", RULE, gt_mode="split_half")
+    assert [(d.wins, d.losses, d.gt_cand) for d in explicit.rounds] == [
+        (d.wins, d.losses, d.gt_cand) for d in implicit.rounds
+    ]
+    assert explicit.rounds[0].gt_cand == pytest.approx(cube.gt_vec(0, "greedy", 1, 1, "v1")[20:].mean())
+    assert not any(d.gt_coupled for d in explicit.rounds)  # disjoint items: never coupled
+
+
+def test_resampled_items_drive_decisions_and_gt():
+    """The H2 bootstrap path: one resampled index vector (repeats allowed) for decisions and GT."""
+    cube = random_cube(R=5, N=30, seeds=(0,), tag="boot")
+    idx = np.random.default_rng(rng_seed("test-boot")).integers(0, 30, size=30)
+    r = simulate(cube, traj(0, 5), EnvSchedule({0: "E1"}), ENVS, "P2", RULE, items=idx, gt_items=idx)
+    for d in r.rounds:
+        cand = cube.vec(0, "greedy", d.round, ("round", d.round), "v1")[idx]
+        ref = cube.vec(0, "greedy", d.inc_before, ("round", d.round), "v1")[idx]
+        p = paired(cand, ref)
+        assert (d.wins, d.losses, d.n) == (p.wins, p.losses, 30)
+        assert d.gt_cand == pytest.approx(cand.mean()) and d.gt_inc == pytest.approx(ref.mean())
+        assert d.gt_coupled
+    assert r.calls["candidate_eval"] == 5 * 30  # costs count the full N, not the resample
+
+
+def test_gt_coupled_flags_rounds_whose_decision_is_the_gt_comparison():
+    """Coupled rounds satisfy wins - losses == n * (gt_cand - gt_inc), so they can never be false accepts."""
+    sched = TEAMMATE_SCHEDULE  # E1 (greedy) rounds 1-3, then t02 segments
+    for physical in (False, True):
+        cube = random_cube(R=11, N=60, seeds=(0,), tag="coupled", physical_greedy=physical)
+        runs = {p: run(cube, p, sched, n_dev=60) for p in ("P1", "P1b", "P2", "P3", "P5", "P4_k3", "ORACLE")}
+        assert all(d.gt_coupled for d in runs["ORACLE"].rounds)
+        # P2's reference IS the incumbent's round-t GT cell under greedy; never under independent t02 draws
+        assert [d.gt_coupled for d in runs["P2"].rounds] == [t < 4 for t in range(1, 12)]
+        # P3 keeps the round-0 reference through the E1 segment: coupled only if reruns are cache hits
+        # P3's E1-segment reference (initial or adopted) is the incumbent's earlier generation: coupled
+        # exactly when greedy reruns are cache hits of it
+        assert [d.gt_coupled for d in runs["P3"].rounds[:3]] == [not physical] * 3
+        for name, r in runs.items():
+            assert r.n_gt_coupled == sum(d.gt_coupled for d in r.rounds)
+            for d in r.rounds:
+                if d.gt_coupled:
+                    assert not d.false_accept, name
+                    if name != "ORACLE":
+                        assert d.wins - d.losses == round(d.n * (d.gt_cand - d.gt_inc)), name
+                        assert d.ref_slot == d.inc_before
+                if d.env_id in ("E2", "E4") and name != "ORACLE":
+                    assert not d.gt_coupled  # independent GT draws
+    # same_draw couples P2 under sampling too
+    cube = random_cube(R=4, N=40, seeds=(0,), tag="same")
+    sd = run(cube, "P2", EnvSchedule({0: "E2"}), gt_mode="same_draw", canonical_env="E2")
+    assert all(d.gt_coupled for d in sd.rounds) and sd.n_false_accepts == 0
+    # surfaced in the frames
+    summ = summarize_policies(list(runs.values())).set_index("policy")
+    assert summ.loc["ORACLE", "n_gt_coupled"] == 11
+    assert summ.loc["P2", "n_gt_coupled"] == 3
+    assert summ.loc["P2", "n_accepted_gt_coupled"] == sum(d.accepted for d in runs["P2"].rounds[:3])
+    rounds_df, _ = runs_to_frames(list(runs.values()))
+    assert rounds_df["gt_coupled"].dtype == bool
+    assert int(rounds_df["gt_coupled"].sum()) == sum(r.n_gt_coupled for r in runs.values())
+    ps = per_seed_frame(list(runs.values()))
+    assert list(ps["n_gt_coupled"]) == [r.n_gt_coupled for r in runs.values()]
+
+
+def test_gt_coupled_detects_cache_hit_references_in_greedy_segments():
+    """With cached greedy reruns, P1b/P3 decisions equal P2's in an unchanged greedy segment (by construction)."""
+    cube = random_cube(R=8, N=50, seeds=(0,), tag="cache")
+    sched = EnvSchedule({0: "E1", 5: "E3"})
+    p2, p3, p1b = (run(cube, p, sched) for p in ("P2", "P3", "P1b"))
+    assert [d.accepted for d in p3.rounds] == [d.accepted for d in p2.rounds]
+    assert all(d.gt_coupled for d in p3.rounds) and p3.n_false_accepts == 0
+    # P1b keeps v1 scores after the extractor change: not coupled from round 5 on unless it adopted under v2
+    for d in p1b.rounds:
+        if d.round >= 5 and d.ref_extractor == "v1":
+            assert not d.gt_coupled
+
+
+def test_adoption_is_free_and_resets_reference_age():
+    R, N = 5, 10
+    cube = det_cube({k: set(range(k + 1)) for k in range(R + 1)}, N=N, R=R)  # every candidate improves
+    sched = EnvSchedule({0: "E1"})
+    p1, p1b, p4 = (run(cube, p, sched, n_dev=N) for p in ("P1", "P1b", "P4_k2"))
+    for r in (p1, p1b, p4):
+        assert r.n_accepted == R and r.n_false_accepts == 0
+    assert p1b.total_calls == p1.total_calls and p1b.calls["reference_refresh"] == 0
+    assert [d.ref_age for d in p1b.rounds] == [1] * R
+    assert [d.ref_slot for d in p1b.rounds] == list(range(R))
+    assert [s.source for s in p1b.refs] == ["initial"] + ["adopt"] * R
+    assert [d.ref_age for d in p1.rounds] == list(range(1, R + 1))
+    # P4 never reaches age 2 because every adoption resets the age
+    assert p4.refreshes == 0 and p4.total_calls == p1.total_calls
+
+
+def test_decisions_do_not_depend_on_the_cost_convention():
+    cube = random_cube(R=11, N=60, seeds=(0,), tag="convs")
+    attempts = {t: 3 for t in range(1, 12)}
+    for p in ("P1", "P3", "P5", "FIXEDAGE_k1", "ORACLE"):
+        a = run(cube, p, n_dev=60)
+        b = run(cube, p, n_dev=60, conv="full", proposer_attempts=attempts)
+        assert [d.accepted for d in a.rounds] == [d.accepted for d in b.rounds]
+        assert b.total_calls > a.total_calls
+
+
+def test_policy_spec_requires_k_for_age_based_kinds():
+    from driftlab.analysis.policies import PolicySpec
+
+    with pytest.raises(ValueError):
+        PolicySpec("X", "age_triggered", True)
+    with pytest.raises(ValueError):
+        PolicySpec("Y", "fixed_age", False, -1)
+    assert PolicySpec("Z", "age_triggered", True, 0).k == 0
+
+
+def test_candidates_frame_ignores_runs_from_other_schedules():
+    cube = random_cube(R=11, N=60, seeds=(0, 1), tag="cf-sched")
+    trajs = {s: traj(s, 11) for s in (0, 1)}
+    plan = AnalysisPlan()
+    good = simulate_all(cube, trajs, plan, ENVS, 60)
+    other = simulate_all(cube, trajs, plan, ENVS, 60, schedule=EnvSchedule({0: "E1", 2: "E4"}))
+    expected = candidates_frame(cube, trajs, plan, ENVS, good)
+    # ablation-style runs listed first must not leak into T5
+    pd.testing.assert_frame_equal(candidates_frame(cube, trajs, plan, ENVS, other + good), expected)
+    pd.testing.assert_frame_equal(candidates_frame(cube, trajs, plan, ENVS, other), expected)
+    # a policy present for one seed only is completed by simulation instead of left blank
+    partial = [r for r in good if not (r.policy.name == "P3" and r.seed == 1)]
+    pd.testing.assert_frame_equal(candidates_frame(cube, trajs, plan, ENVS, partial), expected)
+    assert set(expected["P3"]) <= {"accept", "reject"}
+
+
+def test_gt_coupled_falls_back_to_matrix_semantics_without_gen_rows():
+    """Without gen rows, a non-physical greedy rerun is a cache hit of the slot's creation generation."""
+    stale = {0: {0, 1}, 1: set(range(6)), 2: set(range(4)), 3: set(range(7))}
+    cube = det_cube(stale, N=10, R=3)
+    cube.gen_row[:] = -1
+    sched = EnvSchedule({0: "E1"})
+    assert all(d.gt_coupled for d in run(cube, "P3", sched).rounds)  # reruns are non-physical cache hits
+    cube.physical[:] = True  # every rerun now a fresh generation: only P2's same-cell reference is coupled
+    assert not any(d.gt_coupled for d in run(cube, "P3", sched).rounds)
+    assert all(d.gt_coupled for d in run(cube, "P2", sched).rounds)

@@ -28,8 +28,12 @@ Ground truth
 Under greedy decoding with a fresh reference (P2) and any of the three promotion rules (``net_win`` with
 margin >= 0, ``win_rate``, ``mcnemar``), acceptance requires ``wins > losses`` on the same items the GT is
 computed on, i.e. ``sum(cand) > sum(ref) = N * GT(inc)``, so P2's FAR is **0 by construction**; this is a
-property of the definitions, not a finding. Under sampling the decision and GT use independent draws, and
-``split_half`` decides on items ``[0, N/2)`` and measures GT on ``[N/2, N)``.
+property of the definitions, not a finding. The same holds for *any* policy in a round whose reference is
+the incumbent's cached (non-physical) greedy generation under the current extractor (e.g. P1b/P3/P5 within
+an unchanged greedy segment); every such round is flagged ``RoundDecision.gt_coupled`` and counted in
+``summarize_policies`` (``n_gt_coupled``, ``n_accepted_gt_coupled``) so reports can footnote it. Under
+sampling the decision and GT use independent draws, and ``split_half`` decides on items ``[0, N/2)`` and
+measures GT on ``[N/2, N)`` (explicit ``items`` / ``gt_items`` must then both be given and be disjoint).
 
 Costs (``teammate_v1``) per round: ``n_dev`` (incumbent dev run) + 1 (proposer) + N (candidate eval), plus N
 per reference regeneration; with R = 11, N = n_dev = 200 and the schedule ``{0: E1, 4: E2, 8: E4}`` this gives
@@ -95,6 +99,10 @@ class PolicySpec:
     k: int | None = None
     label: str = ""
     refresh_rule: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind in ("age_triggered", "fixed_age") and (self.k is None or int(self.k) < 0):
+            raise ValueError(f"policy {self.name!r} of kind {self.kind!r} needs an integer k >= 0")
 
 
 _FIXED: dict[str, PolicySpec] = {
@@ -259,6 +267,13 @@ class RoundDecision:
     differs from the round's environment at decision time. ``refresh_kind`` is what happened to the
     reference *this round* before the comparison: ``none | refresh | rescore | fixed_age`` (``initial`` is
     reserved for round 0, which has no decision row).
+
+    ``gt_coupled`` is True when the decision *is* the ground-truth comparison by construction: the reference
+    scores are the very generations, extractor and items that define ``gt_inc`` (and the candidate's decision
+    cell defines ``gt_cand``: greedy or ``same_draw`` GT), so ``wins - losses = n * (gt_cand - gt_inc)`` and,
+    for any rule needing ``wins > losses``, a false accept is impossible. ORACLE rows are always coupled. Such
+    zeros must be footnoted as identical by construction (like the all-pairs ``gt_coupled`` flag), never
+    reported as measured.
     """
 
     seed: int
@@ -287,6 +302,7 @@ class RoundDecision:
     ref_decoding: str = ""
     ref_extractor: str = ""
     ref_env_stale: bool = False
+    gt_coupled: bool = False
 
 
 @dataclass
@@ -343,6 +359,16 @@ class PolicyRun:
         n = self.n_accepted
         return self.n_false_accepts / n if n else float("nan")
 
+    @property
+    def n_gt_coupled(self) -> int:
+        """Rounds whose decision equals the GT comparison by construction (see ``RoundDecision``)."""
+        return int(sum(r.gt_coupled for r in self.rounds))
+
+    @property
+    def n_accepted_gt_coupled(self) -> int:
+        """Accepts that could not have been false accepts by construction."""
+        return int(sum(r.accepted and r.gt_coupled for r in self.rounds))
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -398,12 +424,43 @@ def _resolve_items(
     independent draws. Explicit (possibly resampled, with repeats) index vectors are used as given.
     """
     mode = "independent_draw" if gt_mode == "split_half" else gt_mode
-    if gt_mode == "split_half" and items is None and gt_items is None:
-        h = n_items // 2
-        return np.arange(h), np.arange(h, n_items), mode
+    if gt_mode == "split_half":
+        if items is None and gt_items is None:
+            h = n_items // 2
+            return np.arange(h), np.arange(h, n_items), mode
+        # One half alone would silently decide (or measure GT) on ALL items, re-coupling decision and GT.
+        if items is None or gt_items is None:
+            raise ValueError("split_half needs both items and gt_items (disjoint item sets), or neither")
+        dec, gt = np.asarray(items, dtype=np.int64), np.asarray(gt_items, dtype=np.int64)
+        if np.intersect1d(dec, gt).size:
+            raise ValueError("split_half decision items and GT items must be disjoint")
+        return dec, gt, mode
     dec = np.arange(n_items) if items is None else np.asarray(items, dtype=np.int64)
     gt = None if gt_items is None else np.asarray(gt_items, dtype=np.int64)
     return dec, gt, mode
+
+
+def _same_generations(
+    cube: Cube, seed: int, a: tuple[str, int, Draw], b: tuple[str, int, Draw], items: np.ndarray
+) -> bool:
+    """True when cells ``a`` and ``b`` (``(decoding, slot, draw)``) are the same physical generations.
+
+    Mirrors the all-pairs rule: the identical cell always is; otherwise every compared item must point at the
+    same ``gen_row``; without gen rows, fall back to the matrix semantics of ARCHITECTURE section 4 (a
+    non-physical cell of the same decoding is a cache hit of the slot's creation generation).
+    """
+    if a[0] == b[0] and a[1] == b[1] and tuple(a[2]) == tuple(b[2]):
+        return True
+    if a[0] != b[0] or a[1] != b[1]:
+        return False
+    ga = cube.gen_rows(seed, *a)[items]
+    gb = cube.gen_rows(seed, *b)[items]
+    ok = (ga >= 0) & (gb >= 0)
+    if ok.any():
+        return bool((ga[ok] == gb[ok]).all())
+    if cube.is_physical(seed, *b):
+        return False
+    return tuple(a[2]) == (DRAW_ROUND, int(a[1])) or not cube.is_physical(seed, *a)
 
 
 def item_sets(n_items: int, gt_mode: str) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -444,7 +501,8 @@ def simulate(
 
     ``rule`` is a :class:`driftlab.config.PromotionRule`. ``items`` restricts (or resamples, repeats allowed)
     the decision items, ``gt_items`` the ground-truth items; ``gt_mode`` is passed to ``cube.gt_acc``
-    (``split_half`` is resolved to item halves when no items are given). ``proposer_attempts`` maps round ->
+    (``split_half`` is resolved to item halves when no items are given; explicit items must then come as both
+    ``items`` and ``gt_items``, disjoint, else ``ValueError``). ``proposer_attempts`` maps round ->
     proposer attempts (used by conventions with ``proposer="attempts"``; missing rounds count 1).
     Raises :class:`MissingCell` when a needed cell is absent.
     """
@@ -459,6 +517,9 @@ def simulate(
     env_at = [_env(envmap, sched.env_at(t)) for t in range(R + 1)]
     canon = _env(envmap, str(canonical_env))
     tags = extractor_tags
+    # GT is computed on the same multiset of items as the decision (sums are order-free): precondition of a
+    # by-construction coupling.
+    same_items = np.array_equal(np.sort(dec_items), np.sort(gt_idx) if gt_idx is not None else np.arange(N))
 
     def vec(env: Environment, slot: int, round_: int) -> np.ndarray:
         return cube.vec(seed, env.decoding.id, slot, (DRAW_ROUND, round_), env.extractor)
@@ -571,6 +632,22 @@ def simulate(
             wins, losses, ties, n = p.wins, p.losses, p.ties, p.n
             accepted = bool(decide(wins, losses, n, rule))
 
+        if ref is None:
+            coupled = True  # ORACLE decides on the ground truth itself
+        else:
+            coupled = bool(
+                same_items
+                and (cube.is_greedy(env.decoding.id) or mode == "same_draw")
+                and ref.snap.slot == inc
+                and ref.snap.extractor_at_storage == env.extractor
+                and _same_generations(
+                    cube,
+                    seed,
+                    (ref.snap.decoding, ref.snap.slot, ref.draw),
+                    (env.decoding.id, inc, (DRAW_ROUND, t)),
+                    dec_items,
+                )
+            )
         false_accept = bool(accepted and gt_cand <= gt_inc + GT_EPS)
         inc_after = t if accepted else inc
         rounds.append(
@@ -601,6 +678,7 @@ def simulate(
                 ref_decoding=ref.snap.decoding if ref else "",
                 ref_extractor=ref.snap.extractor_at_storage if ref else "",
                 ref_env_stale=bool(ref and ref.env.fingerprint(tags) != env.fingerprint(tags)),
+                gt_coupled=coupled,
             )
         )
         for key, v in rc.items():
@@ -747,6 +825,7 @@ ROUND_COLUMNS: tuple[str, ...] = (
     "gt_cand",
     "gt_inc",
     "false_accept",
+    "gt_coupled",
     "inc_before",
     "inc_after",
     "cand_slot",
@@ -802,6 +881,8 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     "rescores",
     *(f"calls_{p}" for p in CALL_PURPOSES),
     "convention",
+    "n_gt_coupled",
+    "n_accepted_gt_coupled",
 )
 
 PER_SEED_COLUMNS: tuple[str, ...] = (
@@ -819,6 +900,8 @@ PER_SEED_COLUMNS: tuple[str, ...] = (
     "refreshes",
     "rescores",
     *(f"calls_{p}" for p in CALL_PURPOSES),
+    "n_gt_coupled",
+    "n_accepted_gt_coupled",
 )
 
 CANDIDATE_COLUMNS: tuple[str, ...] = (
@@ -836,7 +919,7 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
 )
 
 _INT_ROUND_COLS = ("seed", "round", "ref_slot", "ref_round", "ref_age", "wins", "losses", "ties", "n")
-_BOOL_ROUND_COLS = ("ref_env_stale", "accepted", "false_accept")
+_BOOL_ROUND_COLS = ("ref_env_stale", "accepted", "false_accept", "gt_coupled")
 _STR_ROUND_COLS = (
     "policy",
     "policy_kind",
@@ -889,6 +972,7 @@ def runs_to_frames(runs: Sequence[PolicyRun]) -> tuple[pd.DataFrame, pd.DataFram
                 "gt_cand": d.gt_cand,
                 "gt_inc": d.gt_inc,
                 "false_accept": d.false_accept,
+                "gt_coupled": d.gt_coupled,
                 "inc_before": d.inc_before,
                 "inc_after": d.inc_after,
                 "cand_slot": d.cand_slot,
@@ -966,7 +1050,10 @@ def summarize_policies(runs: Sequence[PolicyRun]) -> pd.DataFrame:
       like the teammate's T3); ``n_seeds_far`` counts those seeds;
     * ``far_pooled`` = sum of false accepts / sum of accepts with a Wilson 95% CI (``far_lo``, ``far_hi``);
     * call columns are means over seeds, int64 when every policy's value is integral; ``refreshes`` and
-      ``rescores`` likewise.
+      ``rescores`` likewise;
+    * ``n_gt_coupled`` / ``n_accepted_gt_coupled``: rounds / accepts whose decision equals the GT comparison
+      by construction (``RoundDecision.gt_coupled``); when ``n_accepted_gt_coupled == n_accepted`` a zero FAR
+      is identical by construction and must be footnoted, not reported as a finding.
     """
     rows: list[dict] = []
     for name, rs in _group_runs(runs).items():
@@ -1005,6 +1092,8 @@ def summarize_policies(runs: Sequence[PolicyRun]) -> pd.DataFrame:
         for pur in CALL_PURPOSES:
             row[f"calls_{pur}"] = _mean_or_int([r.calls.get(pur, 0) for r in rs])
         row["convention"] = ",".join(sorted({r.convention for r in rs}))
+        row["n_gt_coupled"] = int(sum(r.n_gt_coupled for r in rs))
+        row["n_accepted_gt_coupled"] = int(sum(r.n_accepted_gt_coupled for r in rs))
         rows.append(row)
     if not rows:
         return _empty(SUMMARY_COLUMNS)
@@ -1035,6 +1124,8 @@ def per_seed_frame(runs: Sequence[PolicyRun]) -> pd.DataFrame:
         row["rescores"] = int(r.rescores)
         for pur in CALL_PURPOSES:
             row[f"calls_{pur}"] = int(r.calls.get(pur, 0))
+        row["n_gt_coupled"] = r.n_gt_coupled
+        row["n_accepted_gt_coupled"] = r.n_accepted_gt_coupled
         rows.append(row)
     return pd.DataFrame(rows, columns=list(PER_SEED_COLUMNS)) if rows else _empty(PER_SEED_COLUMNS)
 
@@ -1045,6 +1136,16 @@ def _gt_acc(
     return cube.gt_acc(
         seed, env.decoding.id, slot, round_=round_, extractor=env.extractor, mode=mode, items=items
     )
+
+
+def _run_matches(run: PolicyRun, sched: EnvSchedule, gt_mode: str) -> bool:
+    """Whether ``run`` was simulated under ``sched`` (same env at every round) and ``gt_mode``."""
+    if str(run.gt_mode) != str(gt_mode):
+        return False
+    if not run.schedule:  # hand-built run without provenance: trust the caller
+        return True
+    R = max((d.round for d in run.rounds), default=0)
+    return EnvSchedule(dict(run.schedule)).as_list(R) == sched.as_list(R)
 
 
 def decision_policies(plan) -> list[str]:
@@ -1060,14 +1161,18 @@ def candidates_frame(
     envs: Mapping[str, Environment] | None,
     runs: Sequence[PolicyRun],
     schedule: EnvSchedule | None = None,
+    *,
+    extractor_tags: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
     """T5: one row per (seed, candidate round); columns :data:`CANDIDATE_COLUMNS` + one ``accept``/``reject``
     column per :func:`decision_policies` (named by the policy, e.g. ``"P1"``, ``"ORACLE"``).
 
     ``incumbent_acc`` / ``candidate_acc`` are GT accuracies of the *trajectory* incumbent ``inc_slot[t]`` and
     of slot t under the schedule's env at round t (plan GT mode); ``gt_outcome`` compares them with tolerance
-    ``GT_EPS``. Decisions are taken from ``runs`` (first run per (policy, seed)); a decision policy missing
-    from ``runs`` is simulated here with the plan's settings (decisions do not depend on costs).
+    ``GT_EPS``. Decisions are taken from ``runs`` that were simulated under this schedule and the plan's GT
+    mode (first such run per (policy, seed); runs from other schedules, e.g. ablations, are ignored); a
+    (policy, seed) without one is simulated here with the plan's settings and ``extractor_tags`` (decisions
+    do not depend on costs).
     """
     sched = _as_schedule(schedule if schedule is not None else plan.env_schedule())
     envmap = as_environments(envs)
@@ -1075,10 +1180,15 @@ def candidates_frame(
     dec_names = decision_policies(plan)
     decisions: dict[tuple[str, int], dict[int, bool]] = {}
     for r in runs:
+        if not _run_matches(r, sched, plan.gt.mode):
+            continue
         decisions.setdefault((r.policy.name, int(r.seed)), {d.round: d.accepted for d in r.rounds})
-    missing = [p for p in dec_names if not any(k[0] == p for k in decisions)]
+    seeds = [int(s) for s in cube.seeds if int(s) in tmap]
+    missing = [p for p in dec_names if any((p, s) not in decisions for s in seeds)]
     if missing:
-        extra = simulate_all(cube, tmap, plan, envmap, n_dev=0, policies=missing, schedule=sched)
+        extra = simulate_all(
+            cube, tmap, plan, envmap, n_dev=0, extractor_tags=extractor_tags, policies=missing, schedule=sched
+        )
         for r in extra:
             decisions.setdefault((r.policy.name, int(r.seed)), {d.round: d.accepted for d in r.rounds})
 

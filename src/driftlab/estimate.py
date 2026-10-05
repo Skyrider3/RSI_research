@@ -3,23 +3,29 @@
 Counts follow the planner rules of docs/ARCHITECTURE.md sections 3-4. Notation: S seeds, R rounds
 (K = R + 1 slots), N eval items, D dev items, T = K(K+1)/2 triangle cells per (seed, decoding).
 
-* **logical** = cells / requests the pipeline issues; **executed** = expected cache misses (physical
-  generations actually paid for).
+* **logical** = cells / requests the pipeline issues; **executed** = cache misses (physical generations
+  actually paid for). ``executed`` is the worst case over the trajectories Phase A can produce and
+  ``executed_min`` the best case; they differ only for ``physical_greedy_reruns: ages`` (see below).
 * Phase A per seed: slot-0 dev D (identical greedy request for every seed -> executed once in total),
   candidate dev R*D, proposer R*expected_attempts.
 * Greedy eval: T*N logical cells per seed = creation cells K*N (slot 0 shared across seeds: executed
   N + S*R*N) + rerun cells R(R+1)/2*N, of which the physical (nonce) reruns are executed:
-  ``none`` -> 0; ``all`` -> R(R+1)/2*N per seed; ``ages`` -> sum over a in physical_ages, 0 < a <= R, of
-  (R+1-a)*N per seed.
+  ``none`` -> 0; ``all`` -> R(R+1)/2*N per seed; ``ages`` -> the exact planner rule
+  (:func:`physical_rerun_cells`): cell (k, r) is physical if some all-pairs pair (i, j=r) with
+  ``inc_slot[i] == k`` (incumbent mode) or ``i == k`` (chain mode) has ``j - i`` in ``physical_ages``.
+  Both reference modes are planned, so the count depends on the trajectory (``inc_slot``): with
+  ``inc_slots`` given it is exact; otherwise ``mode: static`` / ``advance_rule: always`` fix the trajectory
+  and ``dev_gated`` reports the min / max over every possible set of accepted rounds
+  (:func:`ages_rerun_bounds`; R=11, ages [0,1,3,5,10]: 36..54 cells per seed).
 * Sampling eval (t02): T*N logical per seed; ``full`` -> all executed; ``lean`` -> K*N executed per seed.
 * GT draws (sampling decodings only): K*N*gt_draws per seed. Audit: slots * repeats * n_items * decodings.
 
-Approximations (upper bounds; the ledger reports the truth after a run):
-* ``ages`` counts one physical cell per (creation round i, j = i + a) pair, i.e. it assumes distinct
-  incumbents. The real set depends on ``inc_slot`` (shared incumbents merge cells; chain-mode cells add some).
-* Physical greedy reruns of slot 0 carry the same nonce for every seed and slot 0 is the same prompt, so they
-  share a gen_key across seeds; they are counted once per seed here.
-* Candidate prompts are assumed distinct across seeds (no cross-seed cache hits).
+Remaining approximations (the ledger reports the truth after a run):
+* Physical greedy reruns of slot 0 carry the same nonce (``rerun:{r}``) in every seed and slot 0 is the same
+  prompt, so under the current key contract they share a gen_key across seeds; they are counted once per
+  seed here (over-count of at most (S-1)*R*N).
+* Candidate prompts are assumed distinct across seeds (no cross-seed cache hits); the audit assumes two
+  distinct slots and counts its t02 draws as executed.
 
 Throughput figures (completion tokens/s, aggregate over large batches) are PLANNING ASSUMPTIONS; recalibrate
 with :func:`calibrate_from_ledger` on the ledger of a smoke run. Prefill time is not modelled separately.
@@ -31,6 +37,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from driftlab.config import AnalysisPlan, ExperimentConfig
@@ -41,6 +48,9 @@ COLAB_SESSION_HOURS = 12.0
 DEFAULT_EXPECTED_ATTEMPTS = 1.3
 # A calibrated throughput is widened to this band (smoke runs use small batches).
 CALIBRATION_BAND: tuple[float, float] = (0.8, 1.25)
+# Batched engines (vLLM / an OpenAI-compatible vLLM server) are far from saturated below this many
+# requests per chunk, so a throughput calibrated on such chunks under-states full-run throughput.
+SMALL_CALIBRATION_BATCH = 128
 
 _VLLM = {"t4": (1000.0, 2000.0), "l4": (2000.0, 4000.0), "a100": (6000.0, 12000.0), "cpu": (5.0, 30.0)}
 _HF = {"t4": (250.0, 450.0), "l4": (500.0, 900.0), "a100": (1500.0, 2500.0), "cpu": (5.0, 15.0)}
@@ -70,32 +80,142 @@ def _used_decodings(cfg: ExperimentConfig) -> tuple[list[str], list[str]]:
     return greedy, [d for d in ordered if d not in greedy]
 
 
-def _row(stage: str, purpose: str, component: str, logical: float, executed: float, note: str = "") -> dict:
+def _row(
+    stage: str,
+    purpose: str,
+    component: str,
+    logical: float,
+    executed: float,
+    note: str = "",
+    executed_min: float | None = None,
+) -> dict:
     return {
         "stage": stage,
         "purpose": purpose,
         "component": component,
         "logical": _ceil(logical),
         "executed": _ceil(executed),
+        "executed_min": _ceil(executed if executed_min is None else executed_min),
         "note": note,
     }
 
 
-def _rerun_pairs(R: int, ages: Iterable[int]) -> int:
-    """Physical greedy rerun cells per seed (in units of N) for ``physical_greedy_reruns: ages``."""
-    return sum(R + 1 - a for a in sorted(set(ages)) if 0 < a <= R)
+def _valid_ages(rounds: int, ages: Iterable[int]) -> tuple[int, ...]:
+    """Distinct ages that can occur in a pair (0 <= a <= R), sorted."""
+    return tuple(sorted({int(a) for a in ages if 0 <= int(a) <= rounds}))
+
+
+def physical_rerun_cells(rounds: int, ages: Iterable[int], inc_slot: Sequence[int]) -> set[tuple[int, int]]:
+    """Greedy rerun cells ``(slot k, round r)`` with ``r > k`` that get a nonce under
+    ``physical_greedy_reruns: ages`` (docs/ARCHITECTURE.md section 4).
+
+    Cell (k, r) is physical if some all-pairs pair (i, j=r), ``j`` in 1..R and ``i`` in 0..j, with
+    ``inc_slot[i] == k`` (incumbent mode) or ``i == k`` (chain mode) has ``j - i`` in ``ages``.
+    ``inc_slot`` is the trajectory incumbent per round 0..R (``inc_slot[0] == inc_slot[1] == 0``).
+    """
+    R = int(rounds)
+    inc = [int(x) for x in inc_slot]
+    if len(inc) != R + 1:
+        raise ValueError(f"inc_slot must have R + 1 = {R + 1} entries (rounds 0..R), got {len(inc)}")
+    if any(not 0 <= k <= max(i - 1, 0) for i, k in enumerate(inc)):
+        raise ValueError(f"invalid inc_slot {inc}: need 0 <= inc_slot[i] < i (and inc_slot[0] == 0)")
+    out: set[tuple[int, int]] = set()
+    for j in range(1, R + 1):
+        for a in _valid_ages(R, ages):
+            i = j - a
+            if i < 0:
+                continue
+            for k in (inc[i], i):
+                if k < j:
+                    out.add((k, j))
+    return out
+
+
+@lru_cache(maxsize=128)
+def _ages_bounds(rounds: int, ages: tuple[int, ...]) -> tuple[int, int]:
+    R, A = rounds, ages
+    pos = [a for a in A if a > 0]
+    chain = [len({k + a for a in pos if k + a <= R}) for k in range(R + 1)]
+
+    def incumbent_slot(k: int, s: int, e: int) -> int:
+        """Cells of slot k when it is the incumbent for rounds i in [s, e] (chain cells included)."""
+        js = {k + a for a in pos if k + a <= R}
+        js.update(i + a for i in range(s, e + 1) for a in A if 1 <= i + a <= R)
+        return len(js)
+
+    # lo/hi[k]: cells of slots >= k given that slot k became the incumbent (slot 0 at round 0, slot k >= 1
+    # by being accepted at round k, i.e. it is the incumbent from round k + 1 on).
+    lo: dict[int, int] = {}
+    hi: dict[int, int] = {}
+    for k in range(R - 1, -1, -1):
+        s = 0 if k == 0 else k + 1
+        options = [(incumbent_slot(k, s, R) + sum(chain[k + 1 :]),) * 2]  # never replaced
+        for nxt in range(k + 1, R):  # next accepted slot: k stays incumbent for rounds s..nxt
+            base = incumbent_slot(k, s, nxt) + sum(chain[k + 1 : nxt])
+            options.append((base + lo[nxt], base + hi[nxt]))
+        lo[k] = min(o[0] for o in options)
+        hi[k] = max(o[1] for o in options)
+    return (lo[0], hi[0]) if R >= 1 else (0, 0)
+
+
+def ages_rerun_bounds(rounds: int, ages: Iterable[int]) -> tuple[int, int]:
+    """(min, max) of ``len(physical_rerun_cells(...))`` over every dev-gated trajectory, i.e. over every set
+    of accepted rounds (dynamic programme over the accepted slots; exact for any R)."""
+    return _ages_bounds(int(rounds), _valid_ages(rounds, ages))
+
+
+def _fixed_trajectory(cfg: ExperimentConfig) -> list[int] | None:
+    """``inc_slot`` when the config determines it (``mode: static`` or ``advance_rule: always``)."""
+    R = cfg.run.rounds
+    if cfg.trajectory.mode == "static":
+        return [0] * (R + 1)
+    if cfg.trajectory.advance_rule == "always":
+        return [0] + [max(t - 1, 0) for t in range(1, R + 1)]
+    return None
+
+
+def _inc_slots_for(cfg: ExperimentConfig, inc_slots: Mapping[int, Sequence[int]] | None) -> list[list[int]]:
+    seeds = list(cfg.run.seeds)
+    missing = [s for s in seeds if s not in (inc_slots or {})]
+    if missing:
+        raise ValueError(f"inc_slots has no trajectory for seed(s) {missing}")
+    return [list((inc_slots or {})[s]) for s in seeds]
+
+
+def _greedy_rerun_cells(
+    cfg: ExperimentConfig, inc_slots: Mapping[int, Sequence[int]] | None
+) -> tuple[int, int, str]:
+    """(max, min) physical greedy rerun cells summed over seeds (units of N) and a note."""
+    R, S, m = cfg.run.rounds, len(cfg.run.seeds), cfg.matrix
+    if m.physical_greedy_reruns == "none":
+        return 0, 0, "all reruns are cache hits (identical by construction)"
+    if m.physical_greedy_reruns == "all":
+        return S * R * (R + 1) // 2, S * R * (R + 1) // 2, "physical rerun for every r > k"
+    ages = list(_valid_ages(R, m.physical_ages))
+    if inc_slots is not None:
+        n = sum(len(physical_rerun_cells(R, ages, inc)) for inc in _inc_slots_for(cfg, inc_slots))
+        return n, n, f"physical at ages {ages} (exact for the given trajectories)"
+    fixed = _fixed_trajectory(cfg)
+    if fixed is not None:
+        n = S * len(physical_rerun_cells(R, ages, fixed))
+        return n, n, f"physical at ages {ages} (trajectory fixed by the config)"
+    lo, hi = ages_rerun_bounds(R, ages)
+    return S * hi, S * lo, f"physical at ages {ages}: {lo}..{hi} cells/seed depending on the trajectory"
 
 
 def count_requests(
     cfg: ExperimentConfig,
     plan: AnalysisPlan | None = None,
     expected_attempts: float = DEFAULT_EXPECTED_ATTEMPTS,
+    inc_slots: Mapping[int, Sequence[int]] | None = None,
 ) -> dict[str, Any]:
-    """Logical and expected executed request counts (see module docstring for the rules).
+    """Logical and executed request counts (see module docstring for the rules).
 
     Returns ``{"params", "rows", "by_purpose", "by_stage", "logical_total", "executed_total",
-    "proposer_max", "notes"}``; each row is ``{stage, purpose, component, logical, executed, note}``.
-    ``plan`` is only recorded (the planner covers both reference modes regardless).
+    "executed_min_total", "proposer_max", "notes"}``; each row is ``{stage, purpose, component, logical,
+    executed, executed_min, note}`` (``executed`` = worst case over possible trajectories, ``executed_min`` =
+    best case). ``inc_slots`` ({seed: inc_slot list for rounds 0..R}, e.g. after Phase A) makes the
+    ``ages`` count exact. ``plan`` is only recorded (the planner covers both reference modes regardless).
     """
     R, S = cfg.run.rounds, len(cfg.run.seeds)
     N, D = cfg.data.eval.n, cfg.data.dev.n
@@ -139,14 +259,18 @@ def count_requests(
                 "slot 0 is the same greedy request for every seed",
             )
         )
-        if m.physical_greedy_reruns == "all":
-            phys, note = reruns_all, "physical rerun for every r > k"
-        elif m.physical_greedy_reruns == "ages":
-            ages = [a for a in sorted(set(m.physical_ages)) if 0 < a <= R]
-            phys, note = _rerun_pairs(R, ages), f"physical at ages {ages} (approx., distinct incumbents)"
-        else:
-            phys, note = 0, "all reruns are cache hits (identical by construction)"
-        rows.append(_row("matrix", "eval_matrix", f"{g} rerun cells", S * reruns_all * N, S * phys * N, note))
+        phys_hi, phys_lo, note = _greedy_rerun_cells(cfg, inc_slots)
+        rows.append(
+            _row(
+                "matrix",
+                "eval_matrix",
+                f"{g} rerun cells",
+                S * reruns_all * N,
+                phys_hi * N,
+                note,
+                executed_min=phys_lo * N,
+            )
+        )
     for d in sampling_ids:
         if m.mode == "full":
             rows.append(
@@ -193,15 +317,19 @@ def count_requests(
     by_stage: dict[str, dict[str, int]] = {}
     for r in rows:
         for agg, key in ((by_purpose, r["purpose"]), (by_stage, r["stage"])):
-            slot = agg.setdefault(key, {"logical": 0, "executed": 0})
+            slot = agg.setdefault(key, {"logical": 0, "executed": 0, "executed_min": 0})
             slot["logical"] += r["logical"]
             slot["executed"] += r["executed"]
+            slot["executed_min"] += r["executed_min"]
     notes = [
         "throughput figures are planning assumptions; recalibrate with calibrate_from_ledger",
-        "executed counts are upper bounds: slot-0 physical greedy reruns share gen_keys across seeds",
+        "slot-0 physical greedy reruns share gen_keys across seeds (nonce rerun:{r}); counted once per seed",
     ]
-    if m.physical_greedy_reruns == "ages":
-        notes.append("ages: one physical cell per (i, i+a) pair, assuming distinct incumbents")
+    if m.physical_greedy_reruns == "ages" and greedy_ids:
+        notes.append(
+            "ages: exact planner rule over both reference modes; executed = worst case, executed_min = best "
+            "case over the trajectories Phase A can produce (pass inc_slots after Phase A for exact counts)"
+        )
     return {
         "params": {
             "run_name": cfg.run.name,
@@ -222,12 +350,14 @@ def count_requests(
             "expected_attempts": attempts,
             "audit": aud.enabled,
             "smoke": cfg.smoke,
+            "trajectory_known": inc_slots is not None,
         },
         "rows": rows,
         "by_purpose": by_purpose,
         "by_stage": by_stage,
         "logical_total": sum(r["logical"] for r in rows),
         "executed_total": sum(r["executed"] for r in rows),
+        "executed_min_total": sum(r["executed_min"] for r in rows),
         "proposer_max": S * R * p.max_attempts,
         "notes": notes,
     }
@@ -249,16 +379,22 @@ class Estimate:
     warnings: list[str] = field(default_factory=list)
     tokens_per_s: tuple[float, float] = (0.0, 0.0)
     calibrated: bool = False
+    executed_min_total: int | None = None  # best case over trajectories (``hours_lo`` uses it)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+_GPU_TOKEN_RE = re.compile(r"(?<![a-z0-9])(t4|l4|a100|cpu)(?![a-z0-9])")
+
+
 def normalize_gpu(gpu: str) -> str:
-    """``"T4"`` -> ``"t4"``, ``"A100-80GB"`` -> ``"a100"``; ``ValueError`` for unknown GPUs."""
-    g = gpu.strip().lower().replace("nvidia", "").replace(" ", "").strip("-_")
+    """GPU class from a name or an ``nvidia-smi`` string: ``"T4"`` / ``"Tesla T4"`` -> ``"t4"``,
+    ``"NVIDIA A100-SXM4-40GB"`` / ``"A100 80GB PCIe"`` -> ``"a100"``; ``ValueError`` for unknown GPUs
+    (``"L40S"``, ``"A10G"``, ``"H100"`` are not L4 / A100)."""
+    g = gpu.strip().lower()
     g = _GPU_ALIASES.get(g, g)
-    m = re.match(r"^(t4|l4|a100|cpu)(?:[-_].*)?$", g)
+    m = _GPU_TOKEN_RE.search(g)
     if m:
         return m.group(1)
     raise ValueError(f"unknown gpu {gpu!r}; expected one of {GPUS}")
@@ -280,15 +416,19 @@ def estimate(
     avg_completion_tokens: float = 300.0,
     plan: AnalysisPlan | None = None,
     calibration: dict | None = None,
+    inc_slots: Mapping[int, Sequence[int]] | None = None,
 ) -> Estimate:
     """Hours range for ``cfg`` on ``gpu`` with ``backend``.
 
-    ``calibration`` (from :func:`calibrate_from_ledger`) replaces the throughput table by the measured
-    tokens/s (widened by :data:`CALIBRATION_BAND`) and, if present, ``avg_completion_tokens`` by the measured
-    mean.
+    ``hours_lo`` = best-case executed count at the high throughput, ``hours_hi`` = worst-case count at the
+    low throughput. ``calibration`` (from :func:`calibrate_from_ledger`) replaces the throughput table by the
+    measured tokens/s (widened by :data:`CALIBRATION_BAND`) and, if present, ``avg_completion_tokens`` by the
+    measured mean. ``inc_slots`` is passed to :func:`count_requests`.
     """
     g, b = normalize_gpu(gpu), normalize_backend(backend)
-    counts = count_requests(cfg, plan)
+    if avg_completion_tokens <= 0:
+        raise ValueError("avg_completion_tokens must be > 0")
+    counts = count_requests(cfg, plan, inc_slots=inc_slots)
     tps_lo, tps_hi = THROUGHPUT[(b, g)]
     tokens = float(avg_completion_tokens)
     calibrated = False
@@ -300,10 +440,9 @@ def estimate(
         if calibration.get("mean_completion_tokens"):
             tokens = float(calibration["mean_completion_tokens"])
         calibrated = True
-    executed = counts["executed_total"]
-    total_tokens = executed * tokens
-    hours_lo = total_tokens / tps_hi / 3600.0
-    hours_hi = total_tokens / tps_lo / 3600.0
+    executed, executed_min = counts["executed_total"], counts["executed_min_total"]
+    hours_lo = executed_min * tokens / tps_hi / 3600.0
+    hours_hi = executed * tokens / tps_lo / 3600.0
 
     warnings: list[str] = []
     if hours_hi > COLAB_SESSION_HOURS:
@@ -321,6 +460,12 @@ def estimate(
         warnings.append("mock backend: SYNTHETIC data; the time estimate is not meaningful")
     if cfg.smoke:
         warnings.append("smoke config: deviates from the protocol (e.g. max_new_tokens != 640)")
+    batch = (calibration or {}).get("mean_batch")
+    if batch is not None and b in ("vllm", "openai_compat") and float(batch) < SMALL_CALIBRATION_BATCH:
+        warnings.append(
+            f"throughput calibrated on small chunks ({float(batch):.0f} generations/chunk on average): a "
+            f"batched engine runs faster on full-size chunks, so these hours are pessimistic"
+        )
     return Estimate(
         counts=counts,
         executed_total=executed,
@@ -333,6 +478,7 @@ def estimate(
         warnings=warnings,
         tokens_per_s=(tps_lo, tps_hi),
         calibrated=calibrated,
+        executed_min_total=executed_min,
     )
 
 
@@ -369,6 +515,13 @@ def format_estimate(e: Estimate) -> str:
         *(line(r) for r in body),
         rule,
         line(total),
+    ]
+    lo = e.executed_min_total
+    if lo is not None and lo != e.executed_total:
+        out.append(
+            f"Executed depends on the trajectory: {lo:,} (best case) - {e.executed_total:,} (worst case, shown)"
+        )
+    out += [
         "",
         f"Throughput ({e.backend} on {e.gpu}): {e.tokens_per_s[0]:,.0f}-{e.tokens_per_s[1]:,.0f} completion tok/s "
         + (
@@ -377,7 +530,7 @@ def format_estimate(e: Estimate) -> str:
             else "[planning assumption; recalibrate after smoke run]"
         ),
         f"Avg completion tokens: {e.avg_completion_tokens:,.0f} -> "
-        f"{e.executed_total * e.avg_completion_tokens / 1e6:,.1f}M tokens executed",
+        f"{e.executed_total * e.avg_completion_tokens / 1e6:,.1f}M tokens executed (worst case)",
         f"Estimated wall time: {_fmt_hours(e.hours_lo)} - {_fmt_hours(e.hours_hi)}",
     ]
     if e.warnings:
@@ -392,8 +545,9 @@ def calibrate_from_ledger(
     """Measured throughput from ledger rows (``completion_tokens``, ``wall_s``, optional ``n_executed`` and
     ``purpose``; dicts or ``sqlite3.Row``). Rows without executed generations are skipped.
 
-    Returns ``{"tokens_per_s", "mean_completion_tokens", "n_rows", "n_executed", "completion_tokens",
-    "wall_s"}``; ``mean_completion_tokens`` is ``None`` when ``n_executed`` is not recorded.
+    Returns ``{"tokens_per_s", "mean_completion_tokens", "mean_batch", "n_rows", "n_executed",
+    "completion_tokens", "wall_s"}``; ``mean_completion_tokens`` and ``mean_batch`` (executed generations per
+    ledger row, i.e. per chunk) are ``None`` when ``n_executed`` is not recorded.
     """
     tokens, wall, executed, n_rows, have_exec = 0, 0.0, 0, 0, True
     for raw in ledger_rows:
@@ -415,6 +569,7 @@ def calibrate_from_ledger(
     return {
         "tokens_per_s": tokens / wall,
         "mean_completion_tokens": tokens / executed if have_exec and executed else None,
+        "mean_batch": executed / n_rows if have_exec and executed else None,
         "n_rows": n_rows,
         "n_executed": executed,
         "completion_tokens": tokens,
@@ -428,10 +583,12 @@ __all__ = [
     "GPUS",
     "THROUGHPUT",
     "Estimate",
+    "ages_rerun_bounds",
     "calibrate_from_ledger",
     "count_requests",
     "estimate",
     "format_estimate",
     "normalize_backend",
     "normalize_gpu",
+    "physical_rerun_cells",
 ]

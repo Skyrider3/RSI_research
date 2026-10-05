@@ -125,9 +125,8 @@ def test_run_ablations_rows_flags_and_inflation():
     p3 = [r for r in runs if r.policy.name == "P3"]
     acc = sum(r.n_accepted for r in p3)
     fa = sum(r.n_false_accepts for r in p3)
-    assert t.loc["A2", "n_accepted_P3"] == acc
-    if acc:
-        assert t.loc["A2", "far_P3"] == pytest.approx(fa / acc)
+    assert t.loc["A2", "n_accepted_P3"] == acc and acc > 0
+    assert t.loc["A2", "far_P3"] == pytest.approx(fa / acc)
     assert t.loc["A2", "gt_acc_P3"] == pytest.approx(np.mean([r.final_acc_canonical for r in p3]))
     assert t.loc["A1", "far_P1"] == t.loc["A4", "far_P1"] or (
         math.isnan(t.loc["A1", "far_P1"]) and math.isnan(t.loc["A4", "far_P1"])
@@ -214,3 +213,41 @@ def test_schedule_randomization_frame_is_exploratory_and_consistent():
     assert (p["P1"]["calls_total"] == R * (D + 1 + N)).all()
     small = schedule_randomization_frame(cube, trajs, plan, ENVS, n_dev=D, policies=("P1",), n=2)
     assert len(small) == 2 * len(seeds)
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_schedule_randomization_does_not_depend_on_env_mapping_order():
+    R, N = 11, 30
+    cube, trajs = random_cube(R, N, (0,), tag="order"), trajs_for((0,), R)
+    plan = _plan(schedule_randomization={"n": 6, "n_changes": 2, "seed": 11})
+    reordered = {k: ENVS[k] for k in ("E4", "E1", "E3", "E2")}
+    a = schedule_randomization_frame(cube, trajs, plan, ENVS, n_dev=N, policies=("P1",))
+    b = schedule_randomization_frame(cube, trajs, plan, reordered, n_dev=N, policies=("P1",))
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_ablation_calls_count_proposer_attempts_under_the_full_convention():
+    R, N, D = 11, 30, 50
+    seeds = (0, 1)
+    cube, trajs = random_cube(R, N, seeds, tag="full"), trajs_for(seeds, R)
+    plan = _plan(cost_convention="full")
+    attempts = {s: {t: 3 for t in range(1, R + 1)} for s in seeds}
+    base = run_ablations(cube, trajs, plan, ENVS, pairs_frame(), n_dev=D).set_index("ablation")
+    full = run_ablations(
+        cube, trajs, plan, ENVS, pairs_frame(), n_dev=D, proposer_attempts_by_seed=attempts
+    ).set_index("ablation")
+    assert (full["calls_P3"] - base["calls_P3"] == 2 * R).all()  # 3 attempts instead of 1 per round
+    # full: inc dev + attempts + candidate dev + eval per round, initial reference, 2 refreshes (A1)
+    assert full.loc["A1", "calls_P3"] == R * (D + 3 + D + N) + N + 2 * N
+    sr = schedule_randomization_frame(
+        cube,
+        trajs,
+        _plan(cost_convention="full", schedule_randomization={"n": 2, "n_changes": 2, "seed": 1}),
+        ENVS,
+        n_dev=D,
+        policies=("P1",),
+        proposer_attempts_by_seed=attempts,
+    )
+    assert (sr["calls_total"] == R * (D + 3 + D + N) + N).all()

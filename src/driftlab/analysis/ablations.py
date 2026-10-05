@@ -122,6 +122,8 @@ def run_ablations(
     pairs_df: pd.DataFrame,
     n_dev: int,
     extractor_tags: Mapping[str, str] | None = None,
+    *,
+    proposer_attempts_by_seed: Mapping[int, Mapping[int, int]] | None = None,
 ) -> pd.DataFrame:
     """T8: one row per ablation of ``plan.ablations`` (plan order); columns :data:`ABLATION_COLUMNS`.
 
@@ -133,6 +135,8 @@ def run_ablations(
     * The P3 slot holds ``FIXEDAGE_k<fixed_age>`` for ablations with ``fixed_age`` (named in ``p3_policy``);
       ``gt_acc_P3`` (canonical env, mean over seeds) and ``calls_P3`` (mean total calls; int when constant)
       come from that policy. ``reference_age_variation`` is False exactly when ``fixed_age`` is set.
+    * ``proposer_attempts_by_seed`` is forwarded to :func:`simulate_all` (needed for exact ``calls_P3`` under
+      the ``full`` convention, which counts every proposer attempt).
     """
     envmap = as_environments(envs)
     tmap = as_trajectories(trajs)
@@ -156,6 +160,7 @@ def run_ablations(
             envmap,
             n_dev,
             extractor_tags=extractor_tags,
+            proposer_attempts_by_seed=proposer_attempts_by_seed,
             policies=["P1", "P1b", third],
             schedule=sched,
         )
@@ -250,19 +255,21 @@ def schedule_randomization_frame(
     extractor_tags: Mapping[str, str] | None = None,
     *,
     n: int | None = None,
+    proposer_attempts_by_seed: Mapping[int, Mapping[int, int]] | None = None,
 ) -> pd.DataFrame:
     """EXPLORATORY: one row per (schedule_id, seed, policy) over random schedules.
 
     Schedules come from :func:`randomize_schedules` with ``plan.schedule_randomization`` (``n`` overrides the
     count), ``R`` = the trajectories' rounds, ``base`` = the plan schedule's round-0 env and ``env_pool`` = the
-    other environments of ``envs``. Columns :data:`SCHEDULE_RANDOM_COLUMNS`; ``far`` is NaN for a seed with no
-    accepts; ``gt_acc`` is the final canonical-env accuracy. ``df.attrs["exploratory"]`` is True.
+    other environments of ``envs`` (sorted, so the schedules do not depend on the mapping's key order).
+    Columns :data:`SCHEDULE_RANDOM_COLUMNS`; ``far`` is NaN for a seed with no accepts; ``gt_acc`` is the final
+    canonical-env accuracy. ``df.attrs["exploratory"]`` is True.
     """
     envmap = as_environments(envs)
     tmap = as_trajectories(trajs)
     cfg = plan.schedule_randomization
     base = str(plan.schedule[0])
-    pool = tuple(e for e in envmap if e != base)
+    pool = tuple(sorted(e for e in envmap if e != base))
     count = int(cfg.n if n is None else n)
     R = min((t.R for t in tmap.values()), default=cube.R)
     scheds = randomize_schedules(R, count, int(cfg.n_changes), int(cfg.seed), env_pool=pool, base=base)
@@ -276,6 +283,7 @@ def schedule_randomization_frame(
             envmap,
             n_dev,
             extractor_tags=extractor_tags,
+            proposer_attempts_by_seed=proposer_attempts_by_seed,
             policies=list(policies),
             schedule=sched,
         )

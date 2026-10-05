@@ -86,6 +86,43 @@ def _argmax_decode(backend: HFBackend, system: str, user: str, max_new: int) -> 
     return out
 
 
+def _gumbel_decode(backend: HFBackend, system: str, user: str, seed: int, dec: Decoding) -> list[int]:
+    """Reference sampler written by hand: Gumbel-max over the RAW logits / T (transformers' own top-k/top-p
+    warpers when enabled), noise from a private ``torch.Generator(seed)``, KV cache, stop on EOS. Any extra
+    processor inside ``generate`` (an inherited top_k=50, a second temperature, a repetition penalty) breaks
+    token-for-token equality with the backend."""
+    ids = backend.tokenizer(backend.render(system, user), return_tensors="pt", add_special_tokens=False)
+    ids = ids["input_ids"].to(backend.device)
+    gen = torch.Generator(device=backend.device)
+    gen.manual_seed(seed)
+    warpers = []
+    if dec.top_k > 0:
+        warpers.append(transformers.TopKLogitsWarper(top_k=dec.top_k))
+    if dec.top_p < 1.0:
+        warpers.append(transformers.TopPLogitsWarper(top_p=dec.top_p))
+    fi = torch.finfo(torch.float32)
+    stop = set(backend.stop_ids)
+    out: list[int] = []
+    with torch.inference_mode():
+        res = backend.model(input_ids=ids, use_cache=True)
+        for _ in range(dec.max_new_tokens):
+            s = res.logits[:, -1].float() / dec.temperature
+            for w in warpers:
+                s = w(ids, s)
+            u = torch.rand(s.shape[-1], generator=gen, device=backend.device, dtype=torch.float32)
+            u = u.clamp(min=fi.tiny, max=1.0 - fi.eps)
+            nxt = int((s[0] - torch.log(-torch.log(u))).argmax())
+            out.append(nxt)
+            if nxt in stop:
+                break
+            res = backend.model(
+                input_ids=torch.tensor([[nxt]], device=backend.device),
+                past_key_values=res.past_key_values,
+                use_cache=True,
+            )
+    return out
+
+
 # --------------------------------------------------------------------------- engine info / loading
 
 
@@ -98,6 +135,7 @@ def test_engine_info_cpu(tiny):
     assert info["batch_size"] == 8
     assert info["stop_token_ids"] == [151645, 151643]  # <|im_end|>, <|endoftext|>
     assert info["transformers"] == transformers.__version__ and info["torch"] == torch.__version__
+    assert info["tokenizers"]  # the tokenizer library version is part of the engine fingerprint
     json.dumps(info)
     assert tiny.tokenizer.padding_side == "left"
     assert tiny.tokenizer.pad_token is not None
@@ -172,6 +210,24 @@ def test_sampling_seed_controls_sample(tiny):
     assert len(texts) == 6
 
 
+@pytest.mark.parametrize(
+    ("temperature", "top_k", "top_p"),
+    [(0.2, 0, 1.0), (0.7, 0, 1.0), (1.0, 5, 1.0), (1.0, 0, 0.9), (0.7, 40, 0.95)],
+)
+def test_sampling_is_exact_gumbel_max_over_raw_logits(tiny, temperature, top_k, top_p):
+    """Every row of a padded batch is token-for-token the hand-written Gumbel-max sample of its own seed."""
+    dec = Decoding(id="s", temperature=temperature, top_k=top_k, top_p=top_p, max_new_tokens=16)
+    seeds = [101, 202, 303]
+    reqs = _reqs(dec, seeds=seeds)
+    assert len(tiny.plan_batches(reqs)) == 1  # one padded batch of prompts with different lengths
+    stop = set(tiny.stop_ids)
+    for res, q, seed in zip(tiny.generate(reqs), QUESTIONS, seeds, strict=True):
+        ref = _gumbel_decode(tiny, SYSTEM, q, seed, dec)
+        assert res.text == tiny.tokenizer.decode([t for t in ref if t not in stop], skip_special_tokens=True)
+        assert res.n_completion_tokens == len(ref)
+        assert res.finish_reason == ("stop" if ref[-1] in stop else "length")
+
+
 def test_sampling_differs_from_greedy(tiny):
     g = tiny.generate(_reqs(GREEDY))
     s = tiny.generate(_reqs(T02, seeds=[5, 6, 7]))
@@ -223,6 +279,13 @@ def test_generation_config_is_fully_explicit(tiny):
     assert gc.repetition_penalty == 1.0 and gc.max_new_tokens == 640
     assert list(gc.eos_token_id) == [151645, 151643]
     assert gc.pad_token_id == tiny.pad_token_id
+    # explicit decoding fields are honoured, never replaced by defaults
+    custom = tiny.generation_config(
+        Decoding(id="c", temperature=0.7, top_p=0.9, top_k=20, repetition_penalty=1.1, max_new_tokens=8)
+    )
+    assert custom.repetition_penalty == 1.1 and custom.max_new_tokens == 8
+    assert custom.do_sample is False  # sampling is done by the Gumbel processor, not by HF's warpers
+    assert custom.top_k is None and custom.top_p is None and custom.temperature is None
 
 
 # --------------------------------------------------------------------------- finish reasons / token counts

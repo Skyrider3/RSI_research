@@ -109,8 +109,44 @@ def test_non_mean_statistic():
     data=st.lists(st.lists(st.integers(-1, 1), min_size=8, max_size=8), min_size=1, max_size=5),
     seed=st.integers(0, 2**31 - 1),
 )
-def test_property_point_inside_ci_bounds(data, seed):
+def test_property_ci_within_range_and_point_is_mean(data, seed):
     arrs = [np.asarray(row, dtype=np.int8) for row in data]
     point, lo, hi = paired_bootstrap_ci(arrs, B=200, seed=seed)
     assert -1.0 <= lo <= hi <= 1.0
     assert point == pytest.approx(float(np.mean(arrs)))
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_indices_must_match_the_item_count():
+    arrs = [np.arange(20, dtype=float)]
+    narrow = bootstrap_indices(10, 50, seed=1)  # resamples 10 of the first 10 items: CI excluded the point
+    with pytest.raises(ValueError, match="do not fit"):
+        paired_bootstrap_ci(arrs, B=50, seed=1, indices=narrow)
+    with pytest.raises(ValueError, match="do not fit"):
+        bootstrap_diff_ci(arrs, arrs, B=50, seed=1, indices=narrow)
+    with pytest.raises(ValueError, match="do not fit"):
+        bootstrap_replicates(arrs, 50, 1, indices=bootstrap_indices(30, 50, seed=1) % 20)
+    with pytest.raises(ValueError, match="must lie"):
+        bootstrap_replicates(arrs, 50, 1, indices=-np.ones((5, 20), dtype=np.int64))
+    with pytest.raises(ValueError, match="do not fit"):
+        bootstrap_replicates(arrs, 50, 1, indices=np.zeros(20, dtype=np.int64))
+
+
+def test_ci_width_matches_the_analytic_standard_error():
+    rng = np.random.default_rng(rng_seed("test-bootstrap", "se"))
+    x = rng.integers(-1, 2, size=400).astype(float)
+    point, lo, hi = paired_bootstrap_ci([x], B=4000, seed=3)
+    se = x.std(ddof=0) / np.sqrt(len(x))
+    assert (hi - lo) / 2 == pytest.approx(1.959964 * se, rel=0.1)
+    assert lo < point < hi
+    # copies of one array (e.g. by-construction duplicates) do not shrink the item-level uncertainty
+    assert paired_bootstrap_ci([x, x, x], B=4000, seed=3) == pytest.approx((point, lo, hi))
+
+
+def test_shared_items_across_seeds_cancel_anticorrelated_arrays():
+    # Two seeds evaluated on the SAME items with opposite per-item effects: the pooled statistic is 0 on every
+    # resample only if one index vector is applied to both (independent per-array resampling would not cancel).
+    x = np.array(_arrays(1, 30, "anti")[0], dtype=float)
+    assert paired_bootstrap_ci([x, -x], B=500, seed=8) == (0.0, 0.0, 0.0)

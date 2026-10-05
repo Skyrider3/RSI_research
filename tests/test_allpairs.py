@@ -474,3 +474,143 @@ def test_table4_frame_rows_and_labels(three_seed_pairs):
     np.testing.assert_allclose(t4["infl_extract"] + t4["infl_generation"], t4["inflation"], atol=1e-12)
     grid = pivot_grid(s)
     assert list(grid.columns) == ["E1", "E2", "E3", "E4"] and list(grid.index) == list(range(6))
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def _two_round_cube(N: int = 20):
+    """Slots 0..1, rounds 0..1; slot 0 rerun at round 1 is filled by the caller."""
+    cube = empty_cube("t", [0], ["greedy", "t02"], ["v1", "v2"], 2, _draws(1), N)
+    s0 = _ones(N, range(10))
+    set_cell(cube, 0, "greedy", 0, ("round", 0), {"v1": s0, "v2": s0}, physical=True)
+    c1 = _ones(N, range(5, 20))
+    set_cell(cube, 0, "greedy", 1, ("round", 1), {"v1": c1, "v2": c1}, physical=True)
+    return cube, s0
+
+
+def test_by_construction_survives_missing_gen_rows():
+    # A loader that leaves gen_row = -1 must not turn a structural zero into a "measured" zero.
+    cube, trajs = synth_cube(R=3, N=20), trajs_for([0], 3)
+    cube.gen_row[:] = -1
+    df = all_pairs(cube, trajs, ENVS, PLAN, env_ids=["E1", "E3"]).df
+    assert df["same_gen_frac"].isna().all()
+    e1 = df[df["env"] == "E1"]
+    assert e1["by_construction"].all()  # age 0: identical cell; age > 0: non-physical cache hits
+    assert (e1["inflation"] == 0.0).all()
+    e3 = df[df["env"] == "E3"]
+    assert not e3["by_construction"].any() and e3["gen_by_construction"].all()
+
+    phys = synth_cube(R=3, N=20, physical_greedy=True)
+    phys.gen_row[:] = -1
+    df = all_pairs(phys, trajs, ENVS, PLAN, env_ids=["E1"]).df
+    assert df.loc[df["age"] == 0, "by_construction"].all()
+    assert not df.loc[df["age"] > 0, "by_construction"].any()
+
+
+def test_partial_generation_sharing_is_measured_not_structural():
+    N = 20
+    cube, s0 = _two_round_cube(N)
+    created = cube.gen_rows(0, "greedy", 0, ("round", 0)).copy()
+    rows = created.copy()
+    rows[N // 2 :] = np.arange(10_000, 10_000 + N - N // 2)  # second half regenerated physically
+    set_cell(cube, 0, "greedy", 0, ("round", 1), {"v1": s0, "v2": s0}, gen_rows=rows, physical=True)
+    row = all_pairs(cube, trajs_for([0], 1), ENVS, PLAN, env_ids=["E1"], ages=[1]).df.iloc[0]
+    assert row["same_gen_frac"] == 0.5
+    assert not row["by_construction"] and not row["gen_by_construction"]
+
+    # split_half decides on the first half only, which IS the cached generation -> structural there
+    pr = all_pairs(cube, trajs_for([0], 1), ENVS, _plan(gt={"mode": "split_half"}), env_ids=["E1"], ages=[1])
+    assert pr.df.iloc[0]["same_gen_frac"] == 1.0 and pr.df.iloc[0]["by_construction"]
+
+
+def test_generation_part_flag_and_table4_marker():
+    seeds = (0, 1)
+    cube, trajs = synth_cube(R=4, seeds=seeds), trajs_for(seeds, 4)  # greedy reruns are cache hits
+    pr = all_pairs(cube, trajs, ENVS, PLAN)
+    df = pr.df
+    greedy = df["decoding"] == "greedy"
+    assert df.loc[greedy, "gen_by_construction"].all()  # E1 and E3: rerun == stored generation
+    assert not df.loc[~greedy, "gen_by_construction"].any()  # t02 full: every round is a fresh draw
+    assert (df.loc[df["gen_by_construction"], "infl_generation"] == 0.0).all()
+    assert (df["by_construction"] == (df["gen_by_construction"] & (df["extractor"] == "v1"))).all()
+    t4 = table4_frame(summarize_pairs(pr, B=100), PLAN).set_index("env")
+    assert t4.loc["E3", "gen_by_construction"] and not t4.loc["E3", "by_construction"]
+    assert t4.loc["E1", "gen_by_construction"] and t4.loc["E1", "by_construction"]
+    assert not t4.loc["E2", "gen_by_construction"] and not t4.loc["E4", "gen_by_construction"]
+
+
+def test_gt_coupling_flag_marks_structurally_zero_far():
+    seeds = (0, 1, 2)
+    cube, trajs = synth_cube(R=5, seeds=seeds, tag="coupling"), trajs_for(seeds, 5)
+    df = all_pairs(cube, trajs, ENVS, PLAN).df
+    assert (df["gt_coupled"] == (df["decoding"] == "greedy")).all()
+    coupled = df[df["gt_coupled"]]
+    # GT is read from the decision cells: w - l = n * (gt_cand - gt_x) for fresh and rerun references
+    np.testing.assert_allclose(
+        coupled["w_fresh"] - coupled["l_fresh"], coupled["n"] * (coupled["gt_cand"] - coupled["gt_cur"])
+    )
+    assert not coupled["fa_cur_fresh"].any() and not coupled["fa_ref_rerun"].any()
+    assert coupled["dec_fresh"].any()  # accepts exist, so the zero FAR is structural, not "no data"
+    same = all_pairs(cube, trajs, ENVS, _plan(gt={"mode": "same_draw"})).df
+    assert same["gt_coupled"].all() and not same["fa_cur_fresh"].any()
+    half = all_pairs(cube, trajs, ENVS, _plan(gt={"mode": "split_half"})).df
+    assert not half["gt_coupled"].any()
+    pr = all_pairs(cube, trajs, ENVS, PLAN)
+    s = summarize_pairs(pr, B=100)
+    assert (s.loc[s["env"].isin(["E1", "E3"]), "gt_coupled_frac"] == 1.0).all()
+    assert (s.loc[s["env"].isin(["E2", "E4"]), "gt_coupled_frac"] == 0.0).all()
+    t7 = table7_frame(s, PLAN)
+    present = t7["n_pairs"] > 0
+    assert (t7.loc[present, "gt_coupled"] == (t7.loc[present, "env"] == "E1")).all()
+    assert not t7.loc[~present, "gt_coupled"].any()
+
+
+def test_summary_rejects_item_diffs_that_do_not_match_rows(three_seed_pairs):
+    pr = three_seed_pairs
+    with pytest.raises(ValueError, match="item_index"):
+        summarize_pairs(PairResult(pr.df, pr.item_diffs, np.arange(5)), B=50)
+    partial = dict(list(pr.item_diffs.items())[1:])
+    with pytest.raises(ValueError, match="missing"):
+        summarize_pairs(PairResult(pr.df, partial, pr.item_index), B=50)
+    no_ci = summarize_pairs(PairResult(pr.df, {}, pr.item_index), B=50)  # e.g. a frame read back from CSV
+    assert no_ci["infl_lo"].isna().all() and no_ci["inflation"].notna().all()
+
+
+def test_far_wilson_bounds_are_exact_at_zero_and_all(three_seed_pairs):
+    s = summarize_pairs(three_seed_pairs, B=50)
+    for r in ("stored", "rerun", "fresh"):
+        acc, fa = s[f"n_accept_{r}"], s[f"n_fa_cur_{r}"]
+        zero = (acc > 0) & (fa == 0)
+        full = (acc > 0) & (fa == acc)
+        assert (s.loc[zero, f"far_cur_{r}_lo"] == 0.0).all()
+        assert (s.loc[full, f"far_cur_{r}_hi"] == 1.0).all()
+        ok = acc > 0
+        assert (s.loc[ok, f"far_cur_{r}_lo"] <= s.loc[ok, f"far_cur_{r}"]).all()
+        assert (s.loc[ok, f"far_cur_{r}"] <= s.loc[ok, f"far_cur_{r}_hi"]).all()
+    assert ((s["n_accept_fresh"] > 0) & (s["n_fa_cur_fresh"] == 0)).any()  # the k == 0 edge is exercised
+
+
+def test_trajectory_sequence_and_duplicate_env_ids():
+    cube, trajs = synth_cube(R=3), trajs_for([0], 3)
+    a = all_pairs(cube, trajs, ENVS, PLAN, env_ids=["E1", "E4"])
+    b = all_pairs(cube, list(trajs.values()), ENVS, PLAN, env_ids=["E1", "E4", "E1"])
+    pd.testing.assert_frame_equal(a.df, b.df)
+    assert set(a.item_diffs) == set(b.item_diffs)
+    # a bare string is one id, not a sequence of characters (T8 would silently get no pairs)
+    pd.testing.assert_frame_equal(filter_pairs(a, env_ids="E4").df, filter_pairs(a, env_ids=["E4"]).df)
+    assert len(filter_pairs(a, env_ids="E4", ages=3, seeds=0).df) == 1
+    pd.testing.assert_frame_equal(
+        all_pairs(cube, trajs, ENVS, PLAN, env_ids="E1", ages=1).df,
+        all_pairs(cube, trajs, ENVS, PLAN, env_ids=["E1"], ages=[1]).df,
+    )
+    s = summarize_pairs(a, by="env", B=20)
+    assert list(s["env"]) == ["E1", "E4"] and list(s.columns[:2]) == ["env", "n_pairs"]
+
+
+def test_table_flags_treat_nan_as_false():
+    s = pd.DataFrame(
+        [{"env": "E1", "age": 0, "n_pairs": 1, "all_by_construction": np.nan, "gt_coupled_frac": np.nan}]
+    )
+    t7 = table7_frame(s, PLAN)
+    assert not t7["by_construction"].any() and not t7["gt_coupled"].any()
